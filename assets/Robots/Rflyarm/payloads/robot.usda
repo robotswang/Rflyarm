@@ -1,0 +1,202 @@
+#usda 1.0
+(
+    customLayerData = {
+        string creator = "URDF USD Converter v0.1.3"
+    }
+    defaultPrim = "robot_arm"
+    doc = """Generated from Composed Stage of root layer /tmp/tmpk0mhskii/robot_arm.usdc
+
+
+Generated from Composed Stage of root layer /tmp/urdf_import_robot_arm_gl3btxp_/usdex_robot_arm/robot_arm.usdc
+
+
+Generated from Composed Stage of root layer /tmp/urdf_import_robot_arm_gl3btxp_/temp_robot_arm/robot_arm.usd
+"""
+    kilogramsPerUnit = 1
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+over "robot_arm" (
+    prepend apiSchemas = ["IsaacRobotAPI"]
+)
+{
+    prepend rel isaac:physics:robotJoints = [
+        </robot_arm/Physics/Joint1>,
+        </robot_arm/Physics/Joint2>,
+        </robot_arm/Physics/Joint3>,
+        </robot_arm/Physics/Joint4>,
+        </robot_arm/Physics/Joint5>,
+        </robot_arm/Physics/Joint6>,
+        </robot_arm/Physics/Gripper_r1>,
+        </robot_arm/Physics/Gripper_r3>,
+        </robot_arm/Physics/Gripper_l1>,
+        </robot_arm/Physics/Gripper_l3>,
+        </robot_arm/Physics/Gripper_r2>,
+        </robot_arm/Physics/Gripper_l2>,
+    ]
+    prepend rel isaac:physics:robotLinks = [
+        </robot_arm/Geometry/base_link>,
+        </robot_arm/Geometry/base_link/Link1>,
+        </robot_arm/Geometry/base_link/Link1/Link2>,
+        </robot_arm/Geometry/base_link/Link1/Link2/Link3>,
+        </robot_arm/Geometry/base_link/Link1/Link2/Link3/Link4>,
+        </robot_arm/Geometry/base_link/Link1/Link2/Link3/Link4/Link5>,
+        </robot_arm/Geometry/base_link/Link1/Link2/Link3/Link4/Link5/Link6>,
+        </robot_arm/Geometry/base_link/Link1/Link2/Link3/Link4/Link5/Link6/Gripper_r1>,
+        </robot_arm/Geometry/base_link/Link1/Link2/Link3/Link4/Link5/Link6/Gripper_r1/Gripper_r2>,
+        </robot_arm/Geometry/base_link/Link1/Link2/Link3/Link4/Link5/Link6/Gripper_r3>,
+        </robot_arm/Geometry/base_link/Link1/Link2/Link3/Link4/Link5/Link6/Gripper_l1>,
+        </robot_arm/Geometry/base_link/Link1/Link2/Link3/Link4/Link5/Link6/Gripper_l1/Gripper_l2>,
+        </robot_arm/Geometry/base_link/Link1/Link2/Link3/Link4/Link5/Link6/Gripper_l3>,
+    ]
+    token isaac:robotType = "Default"
+
+    over "Geometry"
+    {
+        over "base_link" (
+            prepend apiSchemas = ["IsaacLinkAPI"]
+        )
+        {
+            over "Link1" (
+                prepend apiSchemas = ["IsaacLinkAPI"]
+            )
+            {
+                over "Link2" (
+                    prepend apiSchemas = ["IsaacLinkAPI"]
+                )
+                {
+                    over "Link3" (
+                        prepend apiSchemas = ["IsaacLinkAPI"]
+                    )
+                    {
+                        over "Link4" (
+                            prepend apiSchemas = ["IsaacLinkAPI"]
+                        )
+                        {
+                            over "Link5" (
+                                prepend apiSchemas = ["IsaacLinkAPI"]
+                            )
+                            {
+                                over "Link6" (
+                                    prepend apiSchemas = ["IsaacLinkAPI"]
+                                )
+                                {
+                                    over "Gripper_r1" (
+                                        prepend apiSchemas = ["IsaacLinkAPI"]
+                                    )
+                                    {
+                                        over "Gripper_r2" (
+                                            prepend apiSchemas = ["IsaacLinkAPI"]
+                                        )
+                                        {
+                                        }
+                                    }
+
+                                    over "Gripper_r3" (
+                                        prepend apiSchemas = ["IsaacLinkAPI"]
+                                    )
+                                    {
+                                    }
+
+                                    over "Gripper_l1" (
+                                        prepend apiSchemas = ["IsaacLinkAPI"]
+                                    )
+                                    {
+                                        over "Gripper_l2" (
+                                            prepend apiSchemas = ["IsaacLinkAPI"]
+                                        )
+                                        {
+                                        }
+                                    }
+
+                                    over "Gripper_l3" (
+                                        prepend apiSchemas = ["IsaacLinkAPI"]
+                                    )
+                                    {
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    over "Physics"
+    {
+        over "Joint1" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Joint2" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Joint3" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Joint4" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Joint5" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Joint6" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Gripper_r1" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Gripper_r2" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Gripper_r3" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Gripper_l1" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Gripper_l2" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+
+        over "Gripper_l3" (
+            prepend apiSchemas = ["IsaacJointAPI"]
+        )
+        {
+        }
+    }
+}
+

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.Python
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Isaac Sim / Pegasus 运行产物
+results/
+logs/
+*.log
+*.npz
+
+# 编辑器 / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# USD 备份 / 临时
+*.usda.bak
+*.usd.bak

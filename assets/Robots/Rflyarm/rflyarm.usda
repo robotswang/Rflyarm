@@ -1,0 +1,270 @@
+#usda 1.0
+(
+    defaultPrim = "vehicle"
+    upAxis = "Z"
+    metersPerUnit = 1.0
+)
+
+# Aerial Arm: a hexrotor platform built by putting the robot-arm geometry (as pure visual, no physics)
+# on a single flycube-style rigid body, with 6 rotors mounted on it. Structure mirrors the working
+# flycube: vehicle (articulation-root virtual container) -> body (single rigid body + collider + arm
+# visual) + rotor0..5 (rigid bodies, each with a propeller visual and a revolute joint to body).
+def Xform "vehicle" (
+    apiSchemas = ["PhysicsArticulationRootAPI", "PhysxArticulationAPI"]
+)
+{
+    float3 xformOp:rotateXYZ = (0, 0, 0)
+    float3 xformOp:scale = (1, 1, 1)
+    double3 xformOp:translate = (0, 0, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
+
+    def Xform "body" (
+        apiSchemas = ["PhysicsMassAPI", "PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"]
+    )
+    {
+        point3f physics:centerOfMass = (0, 0, 0)
+        float3 physics:diagonalInertia = (0.5, 0.5, 1.0)
+        bool physics:kinematicEnabled = 0
+        float physics:mass = 4.0
+        bool physics:rigidBodyEnabled = 1
+        float physxRigidBody:angularDamping = 0
+        float physxRigidBody:maxAngularVelocity = 10000
+        float physxRigidBody:maxContactImpulse = 0.1
+        quatf xformOp:orient = (1, 0, 0, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        # Robot-arm geometry as pure visual decoration (base.usda is the geometry/assembly layer only;
+        # it carries NO rigid bodies / joints / articulation - those live in the Physics/ payload which
+        # we deliberately do NOT reference here).
+        def Xform "arm_geo" (
+            prepend references = @./payloads/base.usda@
+        )
+        {
+            quatf xformOp:orient = (1, 0, 0, 0)
+            double3 xformOp:scale = (1, 1, 1)
+            double3 xformOp:translate = (0, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        # Invisible collision approximation for the body (a rigid body needs a collider to be stable).
+        def Cube "collision" (
+            apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            float3[] extent = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+            double size = 1.0
+            bool physics:collisionEnabled = 1
+            token visibility = "invisible"
+            quatf xformOp:orient = (1, 0, 0, 0)
+            double3 xformOp:scale = (1.0, 0.9, 0.5)
+            double3 xformOp:translate = (0, 0, 0.05)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+    }
+
+    def Xform "rotor0" (
+        apiSchemas = ["PhysicsMassAPI", "PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"]
+    )
+    {
+        float physics:mass = 0.05
+        float3 physics:diagonalInertia = (9.75e-6, 2.73e-4, 2.74e-4)
+        bool physics:kinematicEnabled = 0
+        bool physics:rigidBodyEnabled = 1
+        float physxRigidBody:angularDamping = 0
+        float physxRigidBody:maxAngularVelocity = 10000
+        float physxRigidBody:maxContactImpulse = 0.1
+        quatf xformOp:orient = (1, 0, 0, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (0.508, 0.0, 0.03)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        def Xform "propeller" (
+            prepend references = @./propeller.usd@
+        )
+        {
+            double3 xformOp:scale = (3, 3, 3)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        def PhysicsRevoluteJoint "joint0"
+        {
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </vehicle/body>
+            rel physics:body1 = </vehicle/rotor0>
+            point3f physics:localPos0 = (0.508, 0.0, 0.03)
+            point3f physics:localPos1 = (0, 0, 0)
+        }
+    }
+
+    def Xform "rotor1" (
+        apiSchemas = ["PhysicsMassAPI", "PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"]
+    )
+    {
+        float physics:mass = 0.05
+        float3 physics:diagonalInertia = (9.75e-6, 2.73e-4, 2.74e-4)
+        bool physics:kinematicEnabled = 0
+        bool physics:rigidBodyEnabled = 1
+        float physxRigidBody:angularDamping = 0
+        float physxRigidBody:maxAngularVelocity = 10000
+        float physxRigidBody:maxContactImpulse = 0.1
+        quatf xformOp:orient = (1, 0, 0, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (0.254, 0.4399, 0.03)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        def Xform "propeller" (
+            prepend references = @./propeller.usd@
+        )
+        {
+            double3 xformOp:scale = (3, 3, 3)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        def PhysicsRevoluteJoint "joint1"
+        {
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </vehicle/body>
+            rel physics:body1 = </vehicle/rotor1>
+            point3f physics:localPos0 = (0.254, 0.4399, 0.03)
+            point3f physics:localPos1 = (0, 0, 0)
+        }
+    }
+
+    def Xform "rotor2" (
+        apiSchemas = ["PhysicsMassAPI", "PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"]
+    )
+    {
+        float physics:mass = 0.05
+        float3 physics:diagonalInertia = (9.75e-6, 2.73e-4, 2.74e-4)
+        bool physics:kinematicEnabled = 0
+        bool physics:rigidBodyEnabled = 1
+        float physxRigidBody:angularDamping = 0
+        float physxRigidBody:maxAngularVelocity = 10000
+        float physxRigidBody:maxContactImpulse = 0.1
+        quatf xformOp:orient = (1, 0, 0, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (-0.254, 0.4399, 0.03)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        def Xform "propeller" (
+            prepend references = @./propeller.usd@
+        )
+        {
+            double3 xformOp:scale = (3, 3, 3)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        def PhysicsRevoluteJoint "joint2"
+        {
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </vehicle/body>
+            rel physics:body1 = </vehicle/rotor2>
+            point3f physics:localPos0 = (-0.254, 0.4399, 0.03)
+            point3f physics:localPos1 = (0, 0, 0)
+        }
+    }
+
+    def Xform "rotor3" (
+        apiSchemas = ["PhysicsMassAPI", "PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"]
+    )
+    {
+        float physics:mass = 0.05
+        float3 physics:diagonalInertia = (9.75e-6, 2.73e-4, 2.74e-4)
+        bool physics:kinematicEnabled = 0
+        bool physics:rigidBodyEnabled = 1
+        float physxRigidBody:angularDamping = 0
+        float physxRigidBody:maxAngularVelocity = 10000
+        float physxRigidBody:maxContactImpulse = 0.1
+        quatf xformOp:orient = (1, 0, 0, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (-0.508, 0.0, 0.03)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        def Xform "propeller" (
+            prepend references = @./propeller.usd@
+        )
+        {
+            double3 xformOp:scale = (3, 3, 3)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        def PhysicsRevoluteJoint "joint3"
+        {
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </vehicle/body>
+            rel physics:body1 = </vehicle/rotor3>
+            point3f physics:localPos0 = (-0.508, 0.0, 0.03)
+            point3f physics:localPos1 = (0, 0, 0)
+        }
+    }
+
+    def Xform "rotor4" (
+        apiSchemas = ["PhysicsMassAPI", "PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"]
+    )
+    {
+        float physics:mass = 0.05
+        float3 physics:diagonalInertia = (9.75e-6, 2.73e-4, 2.74e-4)
+        bool physics:kinematicEnabled = 0
+        bool physics:rigidBodyEnabled = 1
+        float physxRigidBody:angularDamping = 0
+        float physxRigidBody:maxAngularVelocity = 10000
+        float physxRigidBody:maxContactImpulse = 0.1
+        quatf xformOp:orient = (1, 0, 0, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (-0.254, -0.4399, 0.03)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        def Xform "propeller" (
+            prepend references = @./propeller.usd@
+        )
+        {
+            double3 xformOp:scale = (3, 3, 3)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        def PhysicsRevoluteJoint "joint4"
+        {
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </vehicle/body>
+            rel physics:body1 = </vehicle/rotor4>
+            point3f physics:localPos0 = (-0.254, -0.4399, 0.03)
+            point3f physics:localPos1 = (0, 0, 0)
+        }
+    }
+
+    def Xform "rotor5" (
+        apiSchemas = ["PhysicsMassAPI", "PhysicsRigidBodyAPI", "PhysxRigidBodyAPI"]
+    )
+    {
+        float physics:mass = 0.05
+        float3 physics:diagonalInertia = (9.75e-6, 2.73e-4, 2.74e-4)
+        bool physics:kinematicEnabled = 0
+        bool physics:rigidBodyEnabled = 1
+        float physxRigidBody:angularDamping = 0
+        float physxRigidBody:maxAngularVelocity = 10000
+        float physxRigidBody:maxContactImpulse = 0.1
+        quatf xformOp:orient = (1, 0, 0, 0)
+        double3 xformOp:scale = (1, 1, 1)
+        float3 xformOp:translate = (0.254, -0.4399, 0.03)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+
+        def Xform "propeller" (
+            prepend references = @./propeller.usd@
+        )
+        {
+            double3 xformOp:scale = (3, 3, 3)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
+        }
+
+        def PhysicsRevoluteJoint "joint5"
+        {
+            uniform token physics:axis = "Z"
+            rel physics:body0 = </vehicle/body>
+            rel physics:body1 = </vehicle/rotor5>
+            point3f physics:localPos0 = (0.254, -0.4399, 0.03)
+            point3f physics:localPos1 = (0, 0, 0)
+        }
+    }
+}
