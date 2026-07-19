@@ -40,12 +40,13 @@ class HexrotorConfig:
         # The USD file that describes the visual aspect of the vehicle
         self.usd_file = ROBOTS["Rflyarm"]
 
-        # Thrust curve for a hexrotor. Platform body mass ~4 kg -> needs ~40 N hover; rotor_constant 5e-5
-        # gives each rotor up to ~60 N at 1100 rad/s (six rotors ~360 N), plenty of margin.
+        # Thrust curve for the hexrotor. Total system ~107.7 kg -> needs ~1057 N hover.
+        # rotor_constant 1.25e-3 gives each rotor up to 1.25e-3 * 1100^2 = 1512 N at max rad/s
+        # (six rotors ~9075 N), plenty of margin. Scale set by tools/set_body_mass.py.
         self.thrust_curve = QuadraticThrustCurve(config={
             "num_rotors": 6,
-            "rotor_constant": [5e-5, 5e-5, 5e-5, 5e-5, 5e-5, 5e-5],
-            "rolling_moment_coefficient": [1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6],
+            "rotor_constant": [0.00125, 0.00125, 0.00125, 0.00125, 0.00125, 0.00125],
+            "rolling_moment_coefficient": [2.5e-05, 2.5e-05, 2.5e-05, 2.5e-05, 2.5e-05, 2.5e-05],
             "rot_dir": [-1, 1, -1, 1, -1, 1],
             "min_rotor_velocity": [0, 0, 0, 0, 0, 0],
             "max_rotor_velocity": [1100, 1100, 1100, 1100, 1100, 1100],

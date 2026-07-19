@@ -68,7 +68,7 @@ class NonlinearControllerArm(Backend):
         self.int = np.array([0.0, 0.0, 0.0])
 
         # Define the dynamic parameters for the vehicle
-        self.m = 4.30        # Mass in Kg (Aerial Arm: body 4.0 + 6 rotors x 0.05)
+        self.m = 106.25        # kg — body 100 + arm base_link 6.25 (kept by tools/set_body_mass.py)
         self.g = 9.81       # The gravity acceleration ms^-2
 
         # Read the target trajectory from a CSV file inside the trajectories directory
@@ -309,10 +309,11 @@ class NonlinearControllerArm(Backend):
         self.thrust_over_time.append(u_1)
         self.torque_over_time.append(tau)
 
-        # Throttled diagnostic log: print once every ~250 physics steps (~1 s at 250 Hz) so the terminal
-        # shows thrust / attitude error / position even when the platform is tumbling and hard to see.
+        # Throttled diagnostic heartbeat: once every ~250 physics steps (~1 s at 250 Hz). Uses
+        # log_info so it doesn't spam the default (WARNING) terminal; enable with
+        # --/log/level=info when you actually want to watch thrust / attitude error / position.
         if len(self.time_vector) % 250 == 0:
-            carb.log_warn(
+            carb.log_info(
                 "[arm] t=%.1fs u1=%.1fN |tau|=%.2f eR=%.2f pos=[%.2f,%.2f,%.2f]" % (
                     self.total_time, u_1, float(np.linalg.norm(tau)),
                     float(np.linalg.norm(e_R)), self.p[0], self.p[1], self.p[2]
