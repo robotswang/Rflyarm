@@ -1,0 +1,65 @@
+# Lula robot description for the robot_arm (SolidWorks-exported 6-DOF arm + 2-finger gripper).
+# Used by LulaKinematicsSolver together with arm.urdf to solve FK/IK.
+#
+# The generalized coordinates (cspace) are the 6 main arm joints. The gripper joints exist in the
+# URDF but must NOT be part of the IK cspace, so they are pinned to a fixed value via
+# cspace_to_urdf_rules below. FK/IK uses the fixed URDF frame "tool_center"
+# attached to Link6 at the grasp center.
+
+api_version: 1.0
+
+# Generalized coordinates driven by IK (must match URDF joint names, in chain order).
+# arm.urdf is the simulator-facing kinematic description: joint_1..3
+# use +Z so its generalized-coordinate signs exactly match the current USD/PhysX
+# articulation; joint_4..6 retain the exported -Z axes because those USD signs match.
+cspace:
+    - joint_1
+    - joint_2
+    - joint_3
+    - joint_4
+    - joint_5
+    - joint_6
+
+root_link: base_link
+
+# Home configuration (URDF zero pose). Also used as the IK warm-start seed.
+default_q: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+# Per-joint limits used by the solver for acceleration/jerk-aware behaviour. The URDF caps velocity
+# at 5 rad/s; these are conservative multiples consistent with that.
+acceleration_limits: [15.0, 15.0, 15.0, 15.0, 15.0, 15.0]
+jerk_limits: [750.0, 750.0, 750.0, 750.0, 750.0, 750.0]
+
+# URDF dofs that are NOT part of the cspace. The gripper is held fixed (open ~0) during arm IK.
+cspace_to_urdf_rules:
+    - {name: gripper_r1, rule: fixed, value: 0.0}
+    - {name: gripper_r2, rule: fixed, value: 0.0}
+    - {name: gripper_r3, rule: fixed, value: 0.0}
+    - {name: gripper_l1, rule: fixed, value: 0.0}
+    - {name: gripper_l2, rule: fixed, value: 0.0}
+    - {name: gripper_l3, rule: fixed, value: 0.0}
+
+# Collision spheres are used by RMPflow, not by pure FK/IK, but the descriptor parser expects the
+# key to exist. One coarse sphere per link keeps the schema valid without constraining IK.
+collision_spheres:
+    - base_link:
+        - "center": [0.0, 0.0, 0.0]
+          "radius": 0.08
+    - Link1:
+        - "center": [0.0, 0.0, 0.0]
+          "radius": 0.06
+    - Link2:
+        - "center": [0.0, 0.0, 0.0]
+          "radius": 0.06
+    - Link3:
+        - "center": [0.0, 0.0, 0.0]
+          "radius": 0.05
+    - Link4:
+        - "center": [0.0, 0.0, 0.0]
+          "radius": 0.04
+    - Link5:
+        - "center": [0.0, 0.0, 0.0]
+          "radius": 0.04
+    - Link6:
+        - "center": [0.0, 0.0, 0.0]
+          "radius": 0.04

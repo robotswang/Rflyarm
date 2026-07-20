@@ -15,7 +15,6 @@ venv/
 env/
 
 # Isaac Sim / Pegasus 运行产物
-results/
 logs/
 *.log
 *.npz
