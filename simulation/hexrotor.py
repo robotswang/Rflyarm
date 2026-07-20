@@ -24,10 +24,6 @@ from pegasus.simulator.logic.dynamics import LinearDrag
 from pegasus.simulator.logic.thrusters import QuadraticThrustCurve
 from pegasus.simulator.logic.sensors import Barometer, IMU, Magnetometer, GPS
 
-# Location of the Aerial Arm asset
-from pegasus.simulator.params import ROBOTS
-
-
 class HexrotorConfig:
     """
     A data class that is used for configuring a Hexrotor (6 rotors).
@@ -36,9 +32,6 @@ class HexrotorConfig:
     def __init__(self):
         # Stage prefix of the vehicle when spawning in the world
         self.stage_prefix = "hexrotor"
-
-        # The USD file that describes the visual aspect of the vehicle
-        self.usd_file = ROBOTS["Rflyarm"]
 
         # Thrust curve for the hexrotor. Total system ~107.7 kg -> needs ~1057 N hover.
         # rotor_constant 1.25e-3 gives each rotor up to 1.25e-3 * 1100^2 = 1512 N at max rad/s
@@ -72,7 +65,7 @@ class Hexrotor(Vehicle):
         vehicle_id: int = 0,
         init_pos=[0.0, 0.0, 0.5],
         init_orientation=[0.0, 0.0, 0.0, 1.0],
-        config=HexrotorConfig(),
+        config=None,
     ):
         """Initializes the hexrotor object
 
@@ -84,6 +77,11 @@ class Hexrotor(Vehicle):
             init_orientation (list): The initial orientation quaternion [qx, qy, qz, qw]. Defaults to [0.0, 0.0, 0.0, 1.0].
             config (HexrotorConfig, optional): Defaults to HexrotorConfig().
         """
+
+        if config is None:
+            config = HexrotorConfig()
+        if not usd_file:
+            raise ValueError("Hexrotor requires an explicit USD asset path")
 
         # 1. Initiate the Vehicle object itself
         super().__init__(stage_prefix, usd_file, init_pos, init_orientation, config.sensors, config.graphical_sensors, config.graphs, config.backends)
