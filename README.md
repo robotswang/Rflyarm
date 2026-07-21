@@ -1,38 +1,45 @@
-[![Ubuntu 22.04](https://img.shields.io/badge/Ubuntu-22.04LTS-brightgreen.svg)](https://releases.ubuntu.com/22.04/)
-[![Isaac Sim 5.1.0](https://img.shields.io/badge/IsaacSim-5.1.0-brightgreen.svg)](https://developer.nvidia.com/isaac-sim)
-[![ROS 2 Humble](https://img.shields.io/badge/ROS2-Humble-blue.svg)](https://docs.ros.org/en/humble/)
+[![Ubuntu 22.04](https://img.shields.io/badge/Ubuntu-22.04_LTS-brightgreen.svg)](https://releases.ubuntu.com/22.04/)
+[![Isaac Sim 6.0.1](https://img.shields.io/badge/Isaac_Sim-6.0.1-brightgreen.svg)](https://developer.nvidia.com/isaac-sim)
+[![Isaac Lab 3.0.0 Beta 2](https://img.shields.io/badge/Isaac_Lab-3.0.0_Beta_2-orange.svg)](https://isaac-sim.github.io/IsaacLab/release/3.0.0-beta2/)
+[![ROS 2 Humble](https://img.shields.io/badge/ROS_2-Humble-blue.svg)](https://docs.ros.org/en/humble/)
 
 # Rflyarm
 
-Rflyarm 是基于 PegasusSimulator 和 Isaac Sim 5.1.0 的六旋翼机械臂仿真平台。
+Rflyarm 是基于 Isaac Sim 6.0.1 和 Isaac Lab 3.0.0 Beta 2 的六旋翼飞行机械臂室内仿真平台。
 
 ## 安装
 
-请先按照 [Pegasus Simulator 官方文档](https://pegasussimulator.github.io/PegasusSimulator/source/setup/installation.html) 完成安装。
+按 [Isaac Lab 3.0.0 Beta 2 官方二进制安装教程](https://isaac-sim.github.io/IsaacLab/release/3.0.0-beta2/source/setup/installation/binaries_installation.html) 安装 Isaac Sim 6.0.1 和 Isaac Lab，然后克隆本项目：
 
 ```bash
-git clone https://github.com/robotswang/Rflyarm.git ~/Rflyarm
+git clone https://github.com/robotswang/Rflyarm.git
 ```
 
 ## 运行
 
 ```bash
-isaac_run ~/Rflyarm/run_simulation.py
+cd ~/Rflyarm
+./run_simulation.sh
 ```
 
-平台启动后闭环爬升到 `map` 坐标系下的 `(0, 0, 1.5)` m 并悬停。
+平台启动后会闭环飞往 `map` 坐标系下的 `(0, 0, 1.5)` m 并悬停。
+
+## ROS 2 控制
+
+仿真端由 `run_simulation.sh` 自动使用 Isaac Sim 自带的 ROS 2 Humble Python 3.12 环境。
 
 ```bash
-# 查看飞行平台和机械臂状态
+# 状态
+ros2 topic echo /clock
 ros2 topic echo /drone/pose
 ros2 topic echo /joint_states
 ros2 topic echo /arm/ee_pose
 
-# 飞行目标：位置单位 m，姿态为四元数
+# 飞行目标：map 坐标系，位置单位 m
 ros2 topic pub --once /drone/cmd_pose geometry_msgs/msg/PoseStamped \
-  '{header: {frame_id: "map"}, pose: {position: {x: 0.0, y: 0.0, z: 1.5}, orientation: {w: 1.0}}}'
+  '{header: {frame_id: "map"}, pose: {position: {x: 0.0, y: 0.0, z: 2.0}, orientation: {w: 1.0}}}'
 
-# 六个机械臂关节：单位 rad
+# 六个机械臂关节，单位 rad
 ros2 topic pub --once /joint_command sensor_msgs/msg/JointState \
   '{name: ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"], position: [0.0, -0.5, 0.5, 0.0, 0.5, 0.0]}'
 
@@ -40,44 +47,51 @@ ros2 topic pub --once /joint_command sensor_msgs/msg/JointState \
 ros2 topic pub --once /joint_command sensor_msgs/msg/JointState \
   '{name: ["gripper"], position: [0.5]}'
 
-# 机械臂末端位姿控制
+# 机械臂末端全位姿
 ros2 topic pub --once /arm/cmd_pose geometry_msgs/msg/PoseStamped \
   '{header: {frame_id: "base_link"}, pose: {position: {x: 0.0, y: 0.0, z: 0.6}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}'
 ```
 
-## ROS 2 话题
-
 | 方向 | 话题 | 类型 | 说明 |
 |---|---|---|---|
-| 输入 | `/drone/cmd_pose` | `geometry_msgs/msg/PoseStamped` | `map` 坐标系下的飞行目标位姿 |
-| 输入 | `/joint_command` | `sensor_msgs/msg/JointState` | `joint_1..6` 或 `gripper` 位置命令，单位 rad |
-| 输入 | `/arm/cmd_pose` | `geometry_msgs/msg/PoseStamped` | `base_link` 坐标系下的末端目标全位姿 |
-| 输出 | `/drone/pose` | `geometry_msgs/msg/PoseStamped` | 约 60 Hz；`map` 坐标系下的无人机位置与四元数姿态 |
-| 输出 | `/joint_states` | `sensor_msgs/msg/JointState` | 约 60 Hz；关节位置、速度和力/力矩 |
-| 输出 | `/arm/ee_pose` | `geometry_msgs/msg/PoseStamped` | 约 60 Hz；Lula FK 计算的 `tool_center` 当前位姿 |
+| 输入 | `/drone/cmd_pose` | `geometry_msgs/msg/PoseStamped` | `map` 下的飞行目标位姿 |
+| 输入 | `/joint_command` | `sensor_msgs/msg/JointState` | `joint_1..6` 或 `gripper` 位置命令 |
+| 输入 | `/arm/cmd_pose` | `geometry_msgs/msg/PoseStamped` | `base_link` 下的末端目标位姿 |
+| 输出 | `/clock` | `rosgraph_msgs/msg/Clock` | 由物理步长推进的 ROS 仿真时间 |
+| 输出 | `/drone/pose` | `geometry_msgs/msg/PoseStamped` | `map` 下的无人机位置与四元数姿态 |
+| 输出 | `/joint_states` | `sensor_msgs/msg/JointState` | 关节位置、速度和力/力矩 |
+| 输出 | `/arm/ee_pose` | `geometry_msgs/msg/PoseStamped` | Lula FK 计算的 `tool_center` 位姿 |
+
+需要使用 ROS 定时器的外部节点应设置参数 `use_sim_time:=true`；状态消息的
+`header.stamp` 与 `/clock` 均使用仿真时间，界面运行速度则由墙钟时间单独衡量。
 
 ## 项目架构
 
-`run_simulation.py` 是仓库仿真入口，`simulation/` 存放飞行、机械臂和 ROS 2
-运行逻辑，`assets/` 存放完整仓库与 Lula 运动学资产。
-
 ```text
 Rflyarm/
-├── README.md
-├── run_simulation.py                 # GUI 仿真入口
+├── run_simulation.sh             # 唯一启动入口与运行环境配置
+├── run_simulation.py             # Isaac Lab 仿真主循环
 ├── simulation/
-│   ├── __init__.py
-│   ├── hexrotor.py                   # Pegasus 六旋翼机型
-│   ├── geometric_controller.py       # 底层几何飞行控制
-│   ├── flight_controller.py          # ROS 2 飞行位姿控制
-│   ├── arm_controller.py             # 关节、夹爪和笛卡尔控制
-│   ├── arm_kinematics.py             # Lula FK/IK
-│   └── pose_publisher.py             # /drone/pose 位姿发布
-└── assets/
-    ├── Collected_warehouse/
-    │   └── warehouse.usd             # 完整仓库场景
-    └── kinematics/
-        ├── arm.urdf                  # Lula 运动学 URDF
-        ├── robot_description.yaml    # Lula 配置
-        └── meshes/                   # URDF 网格
+│   ├── scene.py                  # 场景与机器人加载配置
+│   ├── flight_controller.py      # 六旋翼飞行控制器
+│   ├── aerial_manipulator.py     # 推力与力矩动力学
+│   ├── arm_controller.py         # 机械臂和夹爪控制
+│   ├── arm_kinematics.py         # Lula 正逆运动学
+│   ├── rotor_visualizer.py       # 旋翼视觉旋转同步
+│   └── ros2_interface.py         # ROS 2 话题接口
+├── assets/
+│   ├── Collected_World/
+│   │   ├── World0.usd            # Collect 生成的 Kit 场景快照
+│   │   └── SubUSDs/
+│   │       ├── World.usd         # 仿真实际加载的组合场景
+│   │       ├── simple_room.usd   # SimpleRoom 环境
+│   │       ├── target_bulb.usd   # 目标灯泡
+│   │       └── rflyarm.usda      # 飞行机械臂
+│   └── kinematics/
+│       ├── arm.urdf              # 机械臂运动学模型
+│       └── robot_description.yaml
+├── tests/
+│   ├── flight_response.py        # 飞控响应测试
+│   └── ros2_smoke.py             # ROS 2 接口测试
+└── README.md
 ```

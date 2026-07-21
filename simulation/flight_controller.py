@@ -1,117 +1,144 @@
-#!/usr/bin/env python
-"""ROS 2 pose controller for the Rflyarm flight platform.
+"""Geometric flight controller using Isaac Lab articulation body state."""
 
-Subscribes to ``/drone/cmd_pose`` and holds the requested position and yaw.
-This controller must remain the first vehicle backend because it owns all six
-rotor commands.
-"""
+from __future__ import annotations
 
-import carb
-import numpy as np
-from scipy.spatial.transform import Rotation
+import torch
 
-import rclpy
-from geometry_msgs.msg import PoseStamped
-
-from simulation.geometric_controller import GeometricController
+import isaaclab.utils.math as math_utils
+from isaaclab_contrib.controllers.lee_controller_utils import compute_desired_orientation
 
 
-class FlightController(GeometricController):
-    """Geometric controller for the Rflyarm whose position/yaw setpoint comes from a
-    ROS2 PoseStamped topic (hover-and-hold at the commanded pose).
+class FlightController:
+    """Track a world-frame ``(x, y, z, yaw)`` target with a body wrench.
 
-    Subscribes: <namespace>/cmd_pose (geometry_msgs/PoseStamped, ENU / map frame)
+    The collected USD's PhysX articulation root link is ``Link3``.  Flight state
+    must therefore be read explicitly from the rigid body named ``body`` instead
+    of from ``robot.data.root_*``.
     """
 
-    def __init__(self, namespace: str = "drone", cmd_pose_topic: str = "cmd_pose",
-                 node_name: str = "rflyarm_pose_controller",
-                 takeoff_altitude: float = 1.5, **kwargs):
+    def __init__(self, robot, dt: float, target=(0.0, 0.0, 1.5, 0.0)):
+        self.robot = robot
+        self.device = robot.device
+        self.dt = float(dt)
+        if self.dt <= 0.0:
+            raise ValueError(f"Flight controller dt must be positive, got {self.dt}")
+        body_ids, body_names = robot.find_bodies(["body"], preserve_order=True)
+        if body_names != ["body"]:
+            raise RuntimeError(f"Expected one flight body named 'body', got {body_names}")
+        self.body_id = body_ids[0]
 
-        kwargs.pop("trajectory_file", None)
-        kwargs.pop("hover_setpoint", None)
-        super().__init__(trajectory_file=None, hover_setpoint=None, **kwargs)
+        self.command = torch.tensor(target, device=self.device, dtype=torch.float32).repeat(robot.num_instances, 1)
+        self.mass = self._to_torch(robot.data.body_mass).sum(dim=1)
+        self.gravity = 9.81
 
-        self._takeoff_altitude = takeoff_altitude
-        self._p_setpoint = None
-        self._setpoint_initialized = False
+        # Cascaded position-to-velocity and velocity-to-acceleration gains.  A
+        # bounded velocity reference makes step commands brake early instead of
+        # crossing the target at high speed.
+        self.k_pos = torch.tensor((0.8, 0.8, 1.8), device=self.device)
+        self.k_vel = torch.tensor((3.0, 3.0, 5.0), device=self.device)
+        self.k_int = torch.tensor((0.05, 0.05, 0.08), device=self.device)
+        self.k_rot = torch.tensor((300.0, 300.0, 300.0), device=self.device)
+        self.k_angvel = torch.tensor((125.0, 125.0, 125.0), device=self.device)
+        self.position_integral = torch.zeros((robot.num_instances, 3), device=self.device)
+        self.integral_limit = 1.0
+        self.integral_band = 0.5
+        self.max_horizontal_velocity = 2.5
+        self.max_vertical_velocity = 1.5
+        self.max_horizontal_acceleration = 2.2
+        self.max_upward_acceleration = 4.5
+        self.max_downward_acceleration = 3.5
+        # The six rotors have much less yaw authority than roll/pitch authority
+        # because yaw comes only from reaction torque (k_m/k_f = 0.02 m).  An
+        # unbounded 90-degree yaw step saturates alternating rotors and turns
+        # the requested yaw torque into excess collective thrust.  Keep the
+        # command inside the approximately 21 N*m hover allocation envelope.
+        self.max_yaw_torque = 20.0
+        self.rotation_matrix_buffer = torch.zeros((robot.num_instances, 3, 3), device=self.device)
 
-        self._yaw_target = 0.0
-        self._yaw_ref = 0.0
-        self._yaw_rate = 0.6
+    def _to_torch(self, array) -> torch.Tensor:
+        value = getattr(array, "torch", array)
+        return value.to(self.device) if torch.is_tensor(value) else torch.as_tensor(value, device=self.device)
 
-        # Integrator sizing: the arm has a lateral COM offset that produces a persistent
-        # ~40 Nm gravity moment on the platform, forcing the flight controller into a steady
-        # ~8 deg tilt that adds a ~1.5 m/s^2 sideways thrust component. Without a wide-enough
-        # int_band the integrator freezes for far targets and the drone parks 1+ m off. The
-        # band must cover the largest routine step (~10 m); the clip is sized to the
-        # correction that Ki eventually needs to accumulate.
-        self._int_limit = 30.0
-        self._int_band = 10.0
+    @property
+    def mass_kg(self) -> float:
+        return float(self.mass[0].item())
 
-        try:
-            rclpy.init()
-        except Exception:
-            pass
+    @property
+    def target_position(self) -> torch.Tensor:
+        return self.command[0, :3]
 
-        self.node = rclpy.create_node(node_name)
-        topic = namespace + "/" + cmd_pose_topic
-        self._cmd_sub = self.node.create_subscription(
-            PoseStamped, topic, self._cmd_pose_callback, 10)
-        carb.log_warn("[FlightController] subscribing target pose on: /" + topic)
+    def set_target(self, position, yaw: float = 0.0) -> None:
+        self.command[:, :3] = torch.as_tensor(position, device=self.device, dtype=torch.float32)
+        self.command[:, 3] = float(yaw)
+        # A previous target's integral bias must not drive the next step command.
+        self.position_integral.zero_()
 
-    def _cmd_pose_callback(self, msg: PoseStamped):
-        self._p_setpoint = np.array([msg.pose.position.x,
-                                     msg.pose.position.y,
-                                     msg.pose.position.z])
-        q = [msg.pose.orientation.x, msg.pose.orientation.y,
-             msg.pose.orientation.z, msg.pose.orientation.w]
-        self._yaw_target = float(Rotation.from_quat(q).as_euler("ZYX")[0])
-        self._setpoint_initialized = True
-        carb.log_warn("[FlightController] new setpoint p=%s yaw_target=%.3f" %
-                      (np.array2string(self._p_setpoint, precision=3), self._yaw_target))
+    def state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        pose = self._to_torch(self.robot.data.body_link_pose_w)[:, self.body_id]
+        velocity = self._to_torch(self.robot.data.body_com_vel_w)[:, self.body_id]
+        position = pose[:, :3]
+        quaternion = pose[:, 3:]
+        linear_velocity_w = velocity[:, :3]
+        angular_velocity_w = velocity[:, 3:]
+        angular_velocity_b = math_utils.quat_apply_inverse(quaternion, angular_velocity_w)
+        return position, quaternion, linear_velocity_w, angular_velocity_b
 
-    def update_state(self, state):
-        super().update_state(state)
-        if not self._setpoint_initialized:
-            self._p_setpoint = np.array([state.position[0], state.position[1], self._takeoff_altitude])
-            yaw0 = float(Rotation.from_quat(state.attitude).as_euler("ZYX")[0])
-            self._yaw_target = yaw0
-            self._yaw_ref = yaw0
-            self._setpoint_initialized = True
+    def compute(self) -> torch.Tensor:
+        position, quaternion, linear_velocity_w, angular_velocity_b = self.state()
+        position_error = self.command[:, :3] - position
 
-    def update(self, dt: float):
-        rclpy.spin_once(self.node, timeout_sec=0)
+        in_band = torch.linalg.vector_norm(position_error, dim=1) < self.integral_band
+        self.position_integral[in_band] += position_error[in_band] * self.dt
+        self.position_integral[~in_band] = 0.0
+        self.position_integral.clamp_(-self.integral_limit, self.integral_limit)
 
-        err = (self._yaw_target - self._yaw_ref + np.pi) % (2 * np.pi) - np.pi
-        max_step = self._yaw_rate * dt
-        self._yaw_ref += float(np.clip(err, -max_step, max_step))
+        desired_velocity_w = self.k_pos * position_error
+        horizontal_velocity = desired_velocity_w[:, :2]
+        horizontal_speed = torch.linalg.vector_norm(horizontal_velocity, dim=1, keepdim=True)
+        horizontal_velocity_scale = torch.clamp(
+            self.max_horizontal_velocity / torch.clamp(horizontal_speed, min=1.0e-6),
+            max=1.0,
+        )
+        desired_velocity_w[:, :2] = horizontal_velocity * horizontal_velocity_scale
+        desired_velocity_w[:, 2].clamp_(-self.max_vertical_velocity, self.max_vertical_velocity)
 
-        int_before = np.array(self.int)
-        far_from_target = (self._p_setpoint is not None and
-                           np.linalg.norm(self.p - self._p_setpoint) > self._int_band)
+        desired_acceleration_w = (
+            self.k_vel * (desired_velocity_w - linear_velocity_w)
+            + self.k_int * self.position_integral
+        )
 
-        super().update(dt)
+        horizontal = desired_acceleration_w[:, :2]
+        horizontal_norm = torch.linalg.vector_norm(horizontal, dim=1, keepdim=True)
+        horizontal_scale = torch.clamp(
+            self.max_horizontal_acceleration / torch.clamp(horizontal_norm, min=1.0e-6),
+            max=1.0,
+        )
+        desired_acceleration_w[:, :2] = horizontal * horizontal_scale
+        desired_acceleration_w[:, 2].clamp_(
+            -self.max_downward_acceleration,
+            self.max_upward_acceleration,
+        )
 
-        if far_from_target:
-            self.int = int_before
-        self.int = np.clip(self.int, -self._int_limit, self._int_limit)
+        desired_acceleration_w[:, 2] += self.gravity
+        desired_force_w = self.mass[:, None] * desired_acceleration_w
 
-    def pd(self, t, s, reverse=False):
-        if self._p_setpoint is None:
-            return np.zeros(3)
-        return self._p_setpoint
+        rotation = math_utils.matrix_from_quat(quaternion)
+        body_z_w = rotation[:, :, 2]
+        total_thrust = torch.sum(desired_force_w * body_z_w, dim=1).clamp(min=0.0)
+        desired_quaternion = compute_desired_orientation(
+            desired_force_w, self.command[:, 3], self.rotation_matrix_buffer
+        )
 
-    def d_pd(self, t, s, reverse=False):
-        return np.zeros(3)
+        error_quaternion = math_utils.quat_mul(math_utils.quat_inv(quaternion), desired_quaternion)
+        error_rotation = math_utils.matrix_from_quat(error_quaternion)
+        skew = error_rotation.transpose(-1, -2) - error_rotation
+        rotation_error = 0.5 * torch.stack(
+            (-skew[:, 1, 2], skew[:, 0, 2], -skew[:, 0, 1]), dim=1
+        )
+        torque = -self.k_rot * rotation_error - self.k_angvel * angular_velocity_b
+        torque[:, 2].clamp_(-self.max_yaw_torque, self.max_yaw_torque)
 
-    def dd_pd(self, t, s, reverse=False):
-        return np.zeros(3)
-
-    def ddd_pd(self, t, s, reverse=False):
-        return np.zeros(3)
-
-    def yaw_d(self, t, s):
-        return self._yaw_ref
-
-    def d_yaw_d(self, t, s):
-        return 0.0
+        wrench = torch.zeros((self.robot.num_instances, 6), device=self.device)
+        wrench[:, 2] = total_thrust
+        wrench[:, 3:] = torque
+        return wrench

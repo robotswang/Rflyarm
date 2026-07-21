@@ -1,0 +1,95 @@
+{
+    "version": "1.0",
+    "file_records": [
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/DefaultMaterial_Base_Color.png",
+            "source_hash": "2d21fe4829e497004d769ab0e84b7e59053cef0b",
+            "target_url": "./SubUSDs/textures/DefaultMaterial_Base_Color.png",
+            "target_hash": "12570743115ab5a93446170de98bc489285f19b1"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/DefaultMaterial_Mixed_AO.png",
+            "source_hash": "69736acfc5fd38f42a5196bee55e4785d64103f2",
+            "target_url": "./SubUSDs/textures/DefaultMaterial_Mixed_AO.png",
+            "target_hash": "f36b104932c79c52279105cd2cd98f8a3e1dd521"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/DefaultMaterial_Normal_DirectX.png",
+            "source_hash": "bd1710bb5908460ee655b691721f7e65f0addcb8",
+            "target_url": "./SubUSDs/textures/DefaultMaterial_Normal_DirectX.png",
+            "target_hash": "6af6a1a4f18e4fb0c2b6310413f344393d01310d"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/DefaultMaterial_Roughness.png",
+            "source_hash": "294f85be6189e940b24d306525b5f5b5a79feecf",
+            "target_url": "./SubUSDs/textures/DefaultMaterial_Roughness.png",
+            "target_hash": "f9e619ac787bccf891d66ae914a29ecf78d01704"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/Parquet_AO.png",
+            "source_hash": "cc463c92ac435a23a0e1c291309f24b395247ee8",
+            "target_url": "./SubUSDs/textures/Parquet_AO.png",
+            "target_hash": "811937130713621c9a6bf5b271d4fb23155283a8"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/Parquet_Color.png",
+            "source_hash": "69acfe764a3d277afda6dee1d339e04cd34af9e4",
+            "target_url": "./SubUSDs/textures/Parquet_Color.png",
+            "target_hash": "3f1e5aa3e9f19e31a6d2227fecd0e16527883b85"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/Parquet_Normal.png",
+            "source_hash": "6b63d9b246d0b7f434e6e6dc97fe2a001031cdea",
+            "target_url": "./SubUSDs/textures/Parquet_Normal.png",
+            "target_hash": "98a507c09e748dea6ff61dfbed442833d6c3dd9f"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/Parquet_Rough.png",
+            "source_hash": "bc80b42b2970c872de884b68fea24b0d9a639a9b",
+            "target_url": "./SubUSDs/textures/Parquet_Rough.png",
+            "target_hash": "5252a79942c782dabea8da28cc52074fcc29e6c5"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/WallWood_Color.png",
+            "source_hash": "cc1c9db05498c804dbf1d7f85fd29b9ba01191be",
+            "target_url": "./SubUSDs/textures/WallWood_Color.png",
+            "target_hash": "839210576a08f8ab49b9a3b64d922db81b2cd751"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/WallWood_Normal.png",
+            "source_hash": "0a93d05587b91c1cfc89ac68f7b6d64765b812ba",
+            "target_url": "./SubUSDs/textures/WallWood_Normal.png",
+            "target_hash": "e082a6974df78e4e63ddb4daac20c6bd406ff5d6"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/WallWood_Rough.png",
+            "source_hash": "5b3d5e9780bd081bb80c4d93b14ecbfac45b8c6d",
+            "target_url": "./SubUSDs/textures/WallWood_Rough.png",
+            "target_hash": "60ec3c1d6044a644531f500b40cb95c36e2509d0"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/WhitePlastic_Color.png",
+            "source_hash": "f3470c3d485820ec4972b92f2818e2aebbe7504d",
+            "target_url": "./SubUSDs/textures/WhitePlastic_Color.png",
+            "target_hash": "b7799fb42304e3f3f93e3dc13e0a804dcffe16b9"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/WhitePlastic_Normal.png",
+            "source_hash": "0e7d86c5ade904aefc2ff17c4393c53d8426d3c5",
+            "target_url": "./SubUSDs/textures/WhitePlastic_Normal.png",
+            "target_hash": "632897197d176d7638384ab192247d98a9336481"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/WhitePlastic_Rough.png",
+            "source_hash": "ed2029c5ae20f391c56a26775938a2aeb89ff6b9",
+            "target_url": "./SubUSDs/textures/WhitePlastic_Rough.png",
+            "target_hash": "893c8d3ebe9086c334cd9c6d648ebae39ee61b2e"
+        },
+        {
+            "source_url": "/home/wjh/Rflyarm/assets/Collected_World/SimpleRoom/Materials/Textures/abandoned_parking_4k.hdr",
+            "source_hash": "43b99456822baf3612336127861912f24fb73c2f",
+            "target_url": "./SubUSDs/textures/abandoned_parking_4k.hdr",
+            "target_hash": "8f073219d4de5138f3c66143af6fd60547d58992"
+        }
+    ]
+}

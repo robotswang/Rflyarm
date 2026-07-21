@@ -1,499 +1,128 @@
-#!/usr/bin/env python
-"""Single-owner ROS 2 joint and Cartesian controller for Rflyarm.
+"""Isaac Lab joint-position controller for the Rflyarm arm and gripper."""
 
-The flight controller remains backends[0].  This backend is the *only* writer of
-arm position targets and exposes the same public topic names/QoS as the verified
-``~/rfly_arm`` setup:
+from __future__ import annotations
 
-* subscribe ``/joint_command`` (sensor_msgs/JointState)
-* subscribe ``/arm/cmd_pose`` (geometry_msgs/PoseStamped, base_link)
-* publish ``/joint_states`` (sensor_msgs/JointState, position/velocity/effort)
-* publish ``/arm/ee_pose`` (geometry_msgs/PoseStamped, base_link -> tool_center)
+import torch
 
-The current CAD gripper has one revolute master DOF (``gripper_r1``).  Its public
-ROS name is the mechanism-level ``gripper`` so the interface exposes exactly one
-gripper field rather than implying two independently controllable fingers.
-"""
-
-import carb
-import numpy as np
-from scipy.spatial.transform import Rotation
-
-import rclpy
-from geometry_msgs.msg import PoseStamped
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import JointState
-
-from pegasus.simulator.logic.backends.backend import Backend, BackendConfig
-from simulation.arm_kinematics import (
-    ARM_JOINT_NAMES,
-    ArmKinematics,
-    DEFAULT_ROBOT_DESCRIPTION_PATH,
-    DEFAULT_URDF_PATH,
-)
+from simulation.arm_kinematics import ArmKinematics
 
 
-class _EmptyConfig(BackendConfig):
-    pass
+ARM_JOINT_NAMES = [f"joint_{index}" for index in range(1, 7)]
+GRIPPER_MASTER_NAME = "gripper_r1"
+# Isaac Lab exposes the first three coordinates with the opposite sign from Lula/URDF.
+KINEMATICS_JOINT_SIGNS = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
 
 
-_ARM_JOINTS = list(ARM_JOINT_NAMES)
-_GRIPPER_PUBLIC = "gripper"
-_PUBLIC_JOINTS = _ARM_JOINTS + [_GRIPPER_PUBLIC]
-_GRIPPER_MASTER = "gripper_r1"
+class ArmController:
+    """Own the arm position targets and apply slew limiting every physics step."""
 
-# Public gripper convention matches the current revolute master: 0 rad=open,
-# 0.5 rad=closed.
-_GRIPPER_CLOSED_RAD = 0.5
-
-
-class ArmController(Backend):
-    """Drive one arm articulation from joint or Cartesian ROS 2 commands.
-
-    Subscribes: /joint_command (sensor_msgs/JointState)
-      msg.name     -- list of joint names to command
-      msg.position -- desired positions [rad], matched positionally to name
-
-    Subscribes: /arm/cmd_pose (geometry_msgs/PoseStamped)
-      pose         -- desired tool_center pose relative to base_link
-    """
-
-    def __init__(self,
-                 articulation_path: str = "/World/rflyarm",
-                 joint_command_topic: str = "/joint_command",
-                 joint_states_topic: str = "/joint_states",
-                 target_pose_topic: str = "/arm/cmd_pose",
-                 ee_pose_topic: str = "/arm/ee_pose",
-                 robot_description_path: str = DEFAULT_ROBOT_DESCRIPTION_PATH,
-                 urdf_path: str = DEFAULT_URDF_PATH,
-                 base_frame: str = "base_link",
-                 ee_frame: str = "tool_center",
-                 usd_base_link_path: str = "/World/rflyarm/arm_geo/Geometry/base_link",
-                 usd_link_root_path: str = "/World/rflyarm/arm_geo/Geometry",
-                 alignment_debug: bool = False,
-                 publish_hz: float = 60.0,
-                 arm_max_speed: float = 1.5,
-                 gripper_max_speed: float = 1.0,
-                 node_name: str = "rflyarm_arm_controller"):
-        super().__init__(_EmptyConfig())
-
-        self._articulation_path = articulation_path
-        self._targets = {}
-        self._commanded = {}
-        self._pending_commands = []
-        self._last_ik_solution = None
-        self._arm_control_mode = "joint"
-        self._cb_counter = 0
-        self._art = None
-        self._dof_index = None
-        self._dc = None
-        self._state_all = None
-        self._publish_period = 1.0 / max(float(publish_hz), 1.0)
-        self._publish_accum = 0.0
-        self._max_speed = {name: float(arm_max_speed) for name in _ARM_JOINTS}
-        self._max_speed[_GRIPPER_MASTER] = float(gripper_max_speed)
-        self._kinematics = ArmKinematics(
-            robot_description_path=robot_description_path,
-            urdf_path=urdf_path,
-            base_frame=base_frame,
-            ee_frame=ee_frame,
+    def __init__(self, robot, max_speed: float = 1.5):
+        self.robot = robot
+        self.device = robot.device
+        ids, names = robot.find_joints(ARM_JOINT_NAMES, preserve_order=True)
+        if names != ARM_JOINT_NAMES:
+            raise RuntimeError(f"Arm joints do not match the expected order: {names}")
+        self.joint_ids = torch.tensor(ids, device=self.device, dtype=torch.int32)
+        self.kinematics_joint_signs = torch.tensor(
+            KINEMATICS_JOINT_SIGNS, device=self.device, dtype=torch.float32
         )
-        self._kinematics_error_logged = False
-        self._usd_base_link_path = str(usd_base_link_path)
-        self._usd_link_root_path = str(usd_link_root_path)
-        self._alignment_debug = bool(alignment_debug)
-        self._alignment_accum = 0.0
-        self._last_alignment_q = None
+        measured = self._positions()
+        self.commanded = measured.clone()
+        self.target = measured.clone()
+        self.max_speed = float(max_speed)
 
-        try:
-            rclpy.init()
-        except Exception:
-            pass
+        gripper_ids, gripper_names = robot.find_joints([GRIPPER_MASTER_NAME], preserve_order=True)
+        if gripper_names != [GRIPPER_MASTER_NAME]:
+            raise RuntimeError(f"Gripper master joint not found: {gripper_names}")
+        self.gripper_id = torch.tensor(gripper_ids, device=self.device, dtype=torch.int32)
+        self.gripper_target = self._all_positions()[:, self.gripper_id].clone()
+        self.kinematics = ArmKinematics()
+        self.last_ik_solution = None
 
-        self.node = rclpy.create_node(node_name)
-        qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        )
-        self._sub = self.node.create_subscription(
-            JointState, joint_command_topic, self._cmd_cb, qos)
-        carb.log_warn("[ArmController] subscribing joint commands on: " + joint_command_topic)
+    def _proxy_to_torch(self, array) -> torch.Tensor:
+        value = getattr(array, "torch", array)
+        return value.to(self.device) if torch.is_tensor(value) else torch.as_tensor(value, device=self.device)
 
-        self._js_pub = self.node.create_publisher(
-            JointState, joint_states_topic, qos)
-        carb.log_warn("[ArmController] publishing joint states on: " + joint_states_topic)
-        self._pose_sub = self.node.create_subscription(
-            PoseStamped, target_pose_topic, self._pose_cmd_cb, qos)
-        carb.log_warn(
-            "[ArmController] subscribing Cartesian targets on: " + target_pose_topic)
-        self._ee_pub = self.node.create_publisher(
-            PoseStamped, ee_pose_topic, qos)
-        carb.log_warn(
-            "[ArmController] publishing base-relative EE pose on: " + ee_pose_topic)
+    def _all_positions(self) -> torch.Tensor:
+        return self._proxy_to_torch(self.robot.data.joint_pos)
 
-    def _cmd_cb(self, msg: JointState):
-        self._cb_counter += 1
-        if not msg.name:
-            carb.log_warn("[ArmController] rejected command with empty name array")
-            return
-        if len(msg.name) != len(msg.position):
-            carb.log_warn(
-                "[ArmController] rejected command: name/position length mismatch (%d/%d)" %
-                (len(msg.name), len(msg.position)))
-            return
+    def _positions(self) -> torch.Tensor:
+        return self._all_positions()[:, self.joint_ids]
 
-        accepted = {}
-        for i in range(len(msg.name)):
-            name = msg.name[i]
-            value = float(msg.position[i])
-            if not np.isfinite(value):
-                carb.log_warn("[ArmController] rejected non-finite target for '%s'" % name)
-                return
-            if name in _ARM_JOINTS:
-                # The USD hard limits are approximately +/-pi.  Keep a small safety margin.
-                accepted[name] = float(np.clip(value, -3.10, 3.10))
-            elif name == _GRIPPER_PUBLIC:
-                accepted[_GRIPPER_MASTER] = float(np.clip(value, 0.0, _GRIPPER_CLOSED_RAD))
+    def set_joint_target(self, target) -> None:
+        value = torch.as_tensor(target, device=self.device, dtype=torch.float32)
+        if value.numel() != 6:
+            raise ValueError("Arm target must contain joint_1 through joint_6")
+        self.target[:] = value.reshape(1, 6)
+
+    def set_named_targets(self, names, positions) -> None:
+        if len(names) != len(positions):
+            raise ValueError("Joint command name and position arrays must have equal length")
+        for name, position in zip(names, positions):
+            if name in ARM_JOINT_NAMES:
+                self.target[:, ARM_JOINT_NAMES.index(name)] = float(position)
+            elif name == "gripper":
+                self.gripper_target[:] = float(max(0.0, min(0.5, position)))
             else:
-                carb.log_warn(
-                    "[ArmController] ignoring unknown joint name '%s' "
-                    "(expected one of %s)" % (name, _PUBLIC_JOINTS))
+                raise ValueError(f"Unknown joint name: {name}")
 
-        if accepted:
-            self._pending_commands.append(("joint", accepted))
+    def set_cartesian_target(self, frame_id, position, quaternion_xyzw):
+        """Solve and apply a full-pose target in the arm ``base_link`` frame."""
+        measured = (
+            self._positions()[0] * self.kinematics_joint_signs
+        ).detach().cpu().numpy()
+        fallback_seeds = []
+        if self.last_ik_solution is not None:
+            fallback_seeds.append(self.last_ik_solution)
+        fallback_seeds.append(torch.zeros(6).numpy())
+        result = self.kinematics.solve(
+            frame_id=frame_id,
+            position=position,
+            quaternion_xyzw=quaternion_xyzw,
+            warm_start=measured,
+            fallback_seeds=fallback_seeds,
+        )
+        self.last_ik_solution = result.joint_positions.copy()
+        self.set_joint_target(
+            torch.as_tensor(result.joint_positions, device=self.device, dtype=torch.float32)
+            * self.kinematics_joint_signs
+        )
+        return result
 
-    def _pose_cmd_cb(self, msg: PoseStamped):
-        self._cb_counter += 1
-        p = msg.pose.position
-        o = msg.pose.orientation
-        # Copy primitive values out of the ROS message.  Solving is deferred until
-        # the articulation is available so the measured joints can seed Lula.
-        command = {
-            "frame_id": str(msg.header.frame_id),
-            "position": np.array([p.x, p.y, p.z], dtype=np.float64),
-            "quaternion_xyzw": np.array([o.x, o.y, o.z, o.w], dtype=np.float64),
-        }
-        self._pending_commands.append(("pose", command))
+    def update(self, dt: float) -> None:
+        max_delta = self.max_speed * float(dt)
+        delta = torch.clamp(self.target - self.commanded, -max_delta, max_delta)
+        self.commanded += delta
+        self.robot.set_joint_position_target_index(target=self.commanded, joint_ids=self.joint_ids)
+        self.robot.set_joint_position_target_index(target=self.gripper_target, joint_ids=self.gripper_id)
 
-    def _measured_arm_positions(self):
-        if self._art is None or self._dof_index is None:
-            return None
+    def position_errors(self, target) -> torch.Tensor:
+        desired = torch.as_tensor(target, device=self.device, dtype=torch.float32).reshape(1, 6)
+        return (self._positions() - desired)[0]
+
+    def joint_state(self):
+        """Return public joint names plus measured position, velocity and effort."""
+        positions = self._all_positions()[0]
+        velocities = self._proxy_to_torch(self.robot.data.joint_vel)[0]
         try:
-            return np.array([
-                float(self._dc.get_dof_position(self._dof_index[name]))
-                for name in _ARM_JOINTS
-            ], dtype=np.float64)
+            efforts = self._proxy_to_torch(self.robot.data.applied_torque)[0]
         except Exception:
-            return None
+            efforts = torch.zeros_like(positions)
+        ids = self.joint_ids.to(dtype=torch.long)
+        gripper_id = self.gripper_id.to(dtype=torch.long)
+        public_names = ARM_JOINT_NAMES + ["gripper"]
+        public_positions = torch.cat((positions[ids], positions[gripper_id]))
+        public_velocities = torch.cat((velocities[ids], velocities[gripper_id]))
+        public_efforts = torch.cat((efforts[ids], efforts[gripper_id]))
+        return (
+            public_names,
+            public_positions.detach().cpu().tolist(),
+            public_velocities.detach().cpu().tolist(),
+            public_efforts.detach().cpu().tolist(),
+        )
 
-    def _apply_pending_commands(self):
-        if not self._pending_commands:
-            return
-        commands = self._pending_commands
-        self._pending_commands = []
-        for command_type, command in commands:
-            if command_type == "joint":
-                self._targets.update(command)
-                if any(name in command for name in _ARM_JOINTS):
-                    self._arm_control_mode = "joint"
-                continue
-
-            measured = self._measured_arm_positions()
-            if measured is None:
-                carb.log_warn(
-                    "[ArmController] Cartesian target deferred: arm state unavailable")
-                self._pending_commands.append((command_type, command))
-                continue
-            fallback_seeds = []
-            if self._last_ik_solution is not None:
-                fallback_seeds.append(self._last_ik_solution)
-            fallback_seeds.append(np.zeros(6, dtype=np.float64))
-            try:
-                result = self._kinematics.solve(
-                    frame_id=command["frame_id"],
-                    position=command["position"],
-                    quaternion_xyzw=command["quaternion_xyzw"],
-                    warm_start=measured,
-                    fallback_seeds=fallback_seeds,
-                )
-            except Exception as exc:
-                carb.log_warn("[ArmController] " + str(exc))
-                continue
-
-            self._last_ik_solution = result.joint_positions.copy()
-            self._targets.update(dict(zip(_ARM_JOINTS, result.joint_positions)))
-            self._arm_control_mode = "cartesian"
-            carb.log_warn(
-                "[ArmController] IK accepted: q=%s, position residual=%.6f m, "
-                "orientation residual=%.3f deg" % (
-                    np.array2string(result.joint_positions, precision=4),
-                    result.position_error_m,
-                    np.rad2deg(result.orientation_error_rad),
-                ))
-
-    def _acquire(self):
-        if self._art is not None:
-            return
-        from omni.isaac.dynamic_control import _dynamic_control
-        self._dc = _dynamic_control.acquire_dynamic_control_interface()
-        self._state_all = _dynamic_control.STATE_ALL
-        self._art = self._dc.get_articulation(self._articulation_path)
-        if self._art == 0 or self._art is None:
-            self._art = None
-            return
-        n = self._dc.get_articulation_dof_count(self._art)
-        self._dof_index = {}
-        for i in range(n):
-            dof = self._dc.get_articulation_dof(self._art, i)
-            name = self._dc.get_dof_name(dof)
-            self._dof_index[name] = dof
-        carb.log_warn("[ArmController] articulation acquired: %d DOFs (%s)" %
-                      (n, ", ".join(self._dof_index.keys())))
-
-        missing = [name for name in _ARM_JOINTS + [_GRIPPER_MASTER]
-                   if name not in self._dof_index]
-        if missing:
-            carb.log_error("[ArmController] required DOFs missing: " + str(missing))
-
-        # Initialize the slew-limited command from the measured state.  This prevents an
-        # acquisition-time jump and makes each new target continuous from the live pose.
-        for name in _ARM_JOINTS + [_GRIPPER_MASTER]:
-            dof = self._dof_index.get(name)
-            if dof is None:
-                continue
-            q = float(self._dc.get_dof_position(dof))
-            self._commanded[name] = q
-            self._targets.setdefault(name, q)
-
-    def update(self, dt: float):
-        for _ in range(32):
-            n_before = self._cb_counter
-            rclpy.spin_once(self.node, timeout_sec=0)
-            if self._cb_counter == n_before:
-                break
-
-        if self._art is None:
-            self._acquire()
-            if self._art is None:
-                return
-
-        # Process joint and Cartesian callbacks in arrival order.  Both update
-        # the same target dictionary; only this backend writes those targets.
-        self._apply_pending_commands()
-
-        # One continuous writer: slew the commanded setpoint toward the latest target,
-        # then apply it every physics step.  This replaces discontinuous target jumps.
-        for name, target in self._targets.items():
-            dof = self._dof_index.get(name)
-            if dof is None:
-                continue
-            commanded = self._commanded.get(name, float(self._dc.get_dof_position(dof)))
-            max_step = self._max_speed.get(name, 1.0) * max(float(dt), 0.0)
-            commanded += float(np.clip(target - commanded, -max_step, max_step))
-            self._commanded[name] = commanded
-            self._dc.set_dof_position_target(dof, commanded)
-
-        self._publish_accum += max(float(dt), 0.0)
-        if self._publish_accum >= self._publish_period:
-            self._publish_accum %= self._publish_period
-            self._publish_joint_states()
-            self._publish_ee_pose()
-
-        if self._alignment_debug:
-            self._alignment_accum += max(float(dt), 0.0)
-            if self._alignment_accum >= 1.0:
-                self._alignment_accum %= 1.0
-                self._maybe_log_kinematic_alignment()
-
-    def _publish_joint_states(self):
-        if self._art is None or self._dof_index is None:
-            return
-        msg = JointState()
-        msg.header.stamp = self.node.get_clock().now().to_msg()
-
-        def read_state(internal_name):
-            dof = self._dof_index.get(internal_name)
-            if dof is None:
-                return None
-            try:
-                state = self._dc.get_dof_state(dof, self._state_all)
-                return float(state.pos), float(state.vel), float(state.effort)
-            except Exception:
-                return float(self._dc.get_dof_position(dof)), 0.0, 0.0
-
-        for name in _ARM_JOINTS:
-            state = read_state(name)
-            if state is None:
-                continue
-            q, qd, effort = state
-            msg.name.append(name)
-            msg.position.append(q)
-            msg.velocity.append(qd)
-            msg.effort.append(effort)
-
-        gripper_state = read_state(_GRIPPER_MASTER)
-        if gripper_state is not None:
-            q, qd, effort = gripper_state
-            msg.name.append(_GRIPPER_PUBLIC)
-            msg.position.append(q)
-            msg.velocity.append(qd)
-            msg.effort.append(effort)
-
-        if msg.name:
-            self._js_pub.publish(msg)
-
-    def _publish_ee_pose(self):
-        measured = self._measured_arm_positions()
-        if measured is None:
-            return
-        try:
-            position, quaternion = self._kinematics.forward(measured)
-            self._kinematics_error_logged = False
-        except Exception as exc:
-            if not self._kinematics_error_logged:
-                carb.log_error("[ArmController] FK unavailable: " + str(exc))
-                self._kinematics_error_logged = True
-            return
-
-        msg = PoseStamped()
-        msg.header.stamp = self.node.get_clock().now().to_msg()
-        msg.header.frame_id = self._kinematics.base_frame
-        msg.pose.position.x = float(position[0])
-        msg.pose.position.y = float(position[1])
-        msg.pose.position.z = float(position[2])
-        msg.pose.orientation.x = float(quaternion[0])
-        msg.pose.orientation.y = float(quaternion[1])
-        msg.pose.orientation.z = float(quaternion[2])
-        msg.pose.orientation.w = float(quaternion[3])
-        self._ee_pub.publish(msg)
-
-    @staticmethod
-    def _matrix_from_pose(position, quaternion_wxyz):
-        quaternion_wxyz = np.asarray(quaternion_wxyz, dtype=np.float64)
-        matrix = np.eye(4, dtype=np.float64)
-        matrix[:3, :3] = Rotation.from_quat(
-            quaternion_wxyz[[1, 2, 3, 0]]).as_matrix()
-        matrix[:3, 3] = np.asarray(position, dtype=np.float64)
-        return matrix
-
-    def _usd_pose_in_base(self, prim_path):
-        from isaacsim.core.utils.xforms import get_world_pose
-
-        base_position, base_quaternion = get_world_pose(
-            self._usd_base_link_path, fabric=True)
-        link_position, link_quaternion = get_world_pose(str(prim_path), fabric=True)
-        base_world = self._matrix_from_pose(base_position, base_quaternion)
-        link_world = self._matrix_from_pose(link_position, link_quaternion)
-        link_base = np.linalg.inv(base_world) @ link_world
-        position = link_base[:3, 3]
-        quaternion_xyzw = Rotation.from_matrix(link_base[:3, :3]).as_quat()
-        return position, quaternion_xyzw
-
-    @staticmethod
-    def _pose_residual(reference_position, reference_quaternion,
-                       measured_position, measured_quaternion):
-        position_error = float(np.linalg.norm(
-            np.asarray(reference_position) - np.asarray(measured_position)))
-        rotation_error = float((
-            Rotation.from_quat(reference_quaternion).inv()
-            * Rotation.from_quat(measured_quaternion)
-        ).magnitude())
-        return position_error, rotation_error
-
-    def _usd_tool_center_in_base(self):
-        left_position, _ = self._usd_pose_in_base(
-            self._usd_link_root_path + "/Gripper_l3")
-        right_position, _ = self._usd_pose_in_base(
-            self._usd_link_root_path + "/Gripper_r3")
-        _, link6_quaternion = self._usd_pose_in_base(
-            self._usd_link_root_path + "/Link6")
-        return 0.5 * (left_position + right_position), link6_quaternion
-
-    def _maybe_log_kinematic_alignment(self):
-        measured = self._measured_arm_positions()
-        if measured is None:
-            return
-        try:
-            velocities = np.array([
-                float(self._dc.get_dof_state(
-                    self._dof_index[name], self._state_all).vel)
-                for name in _ARM_JOINTS
-            ], dtype=np.float64)
-        except Exception:
-            velocities = np.zeros(6, dtype=np.float64)
-        if np.max(np.abs(velocities)) > 0.01:
-            return
-        if (self._last_alignment_q is not None
-                and np.max(np.abs(measured - self._last_alignment_q)) < 0.02):
-            return
-
-        try:
-            carb.log_warn(
-                "[ArmAlignment] q=" + np.array2string(measured, precision=6))
-            for index, frame_name in enumerate(_ARM_JOINTS):
-                # USD/URDF link-frame names remain the CAD names Link1..Link6;
-                # only articulation joint/DOF names use joint_1..joint_6.
-                link_name = "Link%d" % (index + 1)
-                lula_position, lula_quaternion = self._kinematics.forward_frame(
-                    link_name, measured)
-                usd_position, usd_quaternion = self._usd_pose_in_base(
-                    self._usd_link_root_path + "/" + link_name)
-                position_error, rotation_error = self._pose_residual(
-                    lula_position, lula_quaternion, usd_position, usd_quaternion)
-                carb.log_warn(
-                    "[ArmAlignment] %s pos_err=%.9f m rot_err=%.6f deg "
-                    "lula_p=%s usd_p=%s" % (
-                        link_name,
-                        position_error,
-                        np.rad2deg(rotation_error),
-                        np.array2string(lula_position, precision=6),
-                        np.array2string(usd_position, precision=6),
-                    ))
-
-            lula_position, lula_quaternion = self._kinematics.forward(measured)
-            usd_position, usd_quaternion = self._usd_tool_center_in_base()
-            position_error, rotation_error = self._pose_residual(
-                lula_position, lula_quaternion, usd_position, usd_quaternion)
-            carb.log_warn(
-                "[ArmAlignment] tool_center pos_err=%.9f m rot_err=%.6f deg "
-                "lula_p=%s usd_mid_p=%s" % (
-                    position_error,
-                    np.rad2deg(rotation_error),
-                    np.array2string(lula_position, precision=6),
-                    np.array2string(usd_position, precision=6),
-                ))
-            self._last_alignment_q = measured.copy()
-        except Exception as exc:
-            carb.log_error("[ArmAlignment] diagnostic failed: " + str(exc))
-
-    def input_reference(self):
-        # Not driving rotors; multirotor picks up backends[0]'s output for that.
-        return None
-
-    def update_state(self, state):
-        pass
-
-    def update_sensor(self, sensor_type, data):
-        pass
-
-    def update_graphical_sensor(self, sensor_type, data):
-        pass
-
-    def start(self):
-        pass
-
-    def stop(self):
-        pass
-
-    def reset(self):
-        self._art = None
-        self._targets.clear()
-        self._commanded.clear()
-        self._pending_commands.clear()
-        self._last_ik_solution = None
-        self._arm_control_mode = "joint"
-        self._publish_accum = 0.0
-        self._alignment_accum = 0.0
-        self._last_alignment_q = None
+    def end_effector_pose(self):
+        measured = (
+            self._positions()[0] * self.kinematics_joint_signs
+        ).detach().cpu().numpy()
+        return self.kinematics.forward(measured)

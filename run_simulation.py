@@ -1,183 +1,224 @@
-#!/usr/bin/env python
-"""Run the warehouse simulation with flight, arm, IK, and ROS 2 interfaces.
+#!/usr/bin/env python3
+"""Run Rflyarm with Isaac Sim 6.0.1 and Isaac Lab 3.0.0 Beta 2."""
 
-Backend order is significant: ``FlightController`` must remain first because
-the vehicle reads rotor commands from ``backends[0]``.
-"""
+from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
-import carb
-from isaacsim import SimulationApp
+from isaaclab.app import AppLauncher
 
-_parser = argparse.ArgumentParser(description=__doc__)
-_parser.add_argument("--headless", action="store_true")
-_parser.add_argument(
-    "--max-steps",
-    type=int,
-    default=0,
-    help="Stop after this many simulation steps; 0 runs until the app closes.",
-)
-_args, _unknown = _parser.parse_known_args()
 
-simulation_app = SimulationApp({"headless": _args.headless})
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--max-steps", type=int, default=0, help="Stop after N physics steps; 0 runs until closed.")
+parser.add_argument("--target-altitude", type=float, default=1.5, help="Default flight target altitude in metres.")
+parser.add_argument("--verify-flight", action="store_true", help="Run a deterministic flight-platform acceptance test.")
+parser.add_argument("--verify-arm", action="store_true", help="Run the arm acceptance test while holding hover.")
+parser.add_argument("--verify-rotors", action="store_true", help="Verify visual rotor synchronization.")
+parser.add_argument("--no-ros", action="store_true", help="Disable ROS 2 even in the interactive run.")
+parser.add_argument("--physics-hz", type=float, default=250.0, help="Physics update frequency in Hz.")
+parser.add_argument("--render-hz", type=float, default=60.0, help="Maximum visual render frequency in Hz.")
+AppLauncher.add_app_launcher_args(parser)
+args_cli = parser.parse_args()
+if args_cli.physics_hz <= 0.0:
+    parser.error("--physics-hz must be positive")
+if args_cli.render_hz <= 0.0:
+    parser.error("--render-hz must be positive")
 
-# -----------------------------------
-import omni.timeline
-from isaacsim.core.api.world import World
+app_launcher = AppLauncher(args_cli)
+simulation_app = app_launcher.app
 
-from isaacsim.core.utils.extensions import enable_extension
-enable_extension("isaacsim.ros2.bridge")
 
-from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
+import math
+import sys
 
+import torch
+
+import isaaclab.sim as sim_utils
+from isaaclab.scene import InteractiveScene
+from isaaclab.sim import SimulationContext
+
+from simulation.aerial_manipulator import AerialManipulatorDynamics
 from simulation.arm_controller import ArmController
 from simulation.flight_controller import FlightController
-from simulation.hexrotor import Hexrotor, HexrotorConfig
-from simulation.pose_publisher import PosePublisher
-
-from pxr import Sdf, Usd, UsdGeom
-
-TAKEOFF_ALT = 1.5
-NAMESPACE = "drone"       # cmd topic   -> /drone/cmd_pose
-REPO_ROOT = Path(__file__).resolve().parent
-WAREHOUSE_USD = REPO_ROOT / "assets/Collected_warehouse/warehouse.usd"
-ARM_URDF = REPO_ROOT / "assets/kinematics/arm.urdf"
-ARM_DESCRIPTION = REPO_ROOT / "assets/kinematics/robot_description.yaml"
-WAREHOUSE_PRIM = "/World/layout"
-EMBEDDED_RFLYARM_PRIM = WAREHOUSE_PRIM + "/rflyarm"
-RFLYARM_PRIM = "/World/rflyarm"
+from simulation.rotor_visualizer import RotorVisualizer
+from simulation.scene import RflyarmSceneCfg
 
 
-class PegasusApp:
+PHYSICS_DT = 1.0 / args_cli.physics_hz
+RENDER_INTERVAL = max(1, round(args_cli.physics_hz / args_cli.render_hz))
+FLIGHT_TARGET_XY = (0.0, 0.0)
+ARM_TEST_TARGET = (0.20, -0.50, 0.45, 0.10, 0.35, -0.20)
 
-    def __init__(self):
-        self.timeline = omni.timeline.get_timeline_interface()
-        self.pg = PegasusInterface()
 
-        self.pg._world = World(**self.pg._world_settings)
-        self.world = self.pg.world
-        vehicle_usd, init_pos, init_orientation = self._load_warehouse()
+def _flight_metrics(flight: FlightController, target: torch.Tensor) -> dict[str, float]:
+    positions, quaternions, velocities, _angular_velocities = flight.state()
+    position = positions[0]
+    velocity = velocities[0]
+    quaternion = quaternions[0]
+    # For xyzw quaternions, cos(tilt) is the world-Z projection of body Z.
+    x, y, _z, w = quaternion
+    body_z_world_z = 1.0 - 2.0 * (x * x + y * y)
+    tilt = torch.acos(torch.clamp(body_z_world_z, -1.0, 1.0))
+    return {
+        "position_error": float(torch.linalg.vector_norm(position - target).item()),
+        "horizontal_error": float(torch.linalg.vector_norm(position[:2] - target[:2]).item()),
+        "altitude_error": float(torch.abs(position[2] - target[2]).item()),
+        "speed": float(torch.linalg.vector_norm(velocity).item()),
+        "tilt_deg": math.degrees(float(tilt.item())),
+        "x": float(position[0].item()),
+        "y": float(position[1].item()),
+        "z": float(position[2].item()),
+    }
 
-        config = HexrotorConfig()
-        # ORDER MATTERS: rotors are driven by backends[0].input_reference().
-        config.backends = [
-            FlightController(
-                namespace=NAMESPACE,
-                cmd_pose_topic="cmd_pose",
-                takeoff_altitude=TAKEOFF_ALT,
-                Kp=[150.0, 150.0, 150.0],
-                Kd=[225.0, 225.0, 225.0],
-                Ki=[30.0, 30.0, 30.0],
-                Kr=[300.0, 300.0, 300.0],
-                Kw=[125.0, 125.0, 125.0],
-            ),
-            # Single-owner arm controller.  Flight remains exclusively on backends[0].
-            ArmController(
-                articulation_path=RFLYARM_PRIM,
-                joint_command_topic="/joint_command",
-                joint_states_topic="/joint_states",
-                target_pose_topic="/arm/cmd_pose",
-                ee_pose_topic="/arm/ee_pose",
-                robot_description_path=str(ARM_DESCRIPTION),
-                urdf_path=str(ARM_URDF),
-                base_frame="base_link",
-                ee_frame="tool_center",
-                usd_base_link_path=RFLYARM_PRIM + "/arm_geo/Geometry/base_link",
-                usd_link_root_path=RFLYARM_PRIM + "/arm_geo/Geometry",
-                alignment_debug=True,
-                publish_hz=60.0,
-                arm_max_speed=1.5,
-            ),
-            PosePublisher(
-                topic="/drone/pose",
-                frame_id="map",
-                publish_hz=60.0,
-            ),
-        ]
 
-        Hexrotor(
-            RFLYARM_PRIM,
-            vehicle_usd,
-            0,
-            init_pos,
-            init_orientation,
-            config=config,
-        )
+def run_simulator(sim: SimulationContext, scene: InteractiveScene) -> None:
+    robot = scene["rflyarm"]
+    sim_dt = sim.get_physics_dt()
 
-        self.world.reset()
-        self.stop_sim = False
+    flight = FlightController(
+        robot=robot,
+        dt=sim_dt,
+        target=(FLIGHT_TARGET_XY[0], FLIGHT_TARGET_XY[1], args_cli.target_altitude, 0.0),
+    )
+    dynamics = AerialManipulatorDynamics(robot=robot, dt=sim_dt)
+    arm = ArmController(robot=robot)
+    rotor_visualizer = RotorVisualizer(robot=robot)
 
-    def _load_warehouse(self):
-        """Reference the warehouse and prepare its collected Rflyarm asset."""
-        if not WAREHOUSE_USD.is_file():
-            raise FileNotFoundError("Warehouse USD not found: " + str(WAREHOUSE_USD))
+    print(f"[Rflyarm] bodies ({robot.num_bodies}): {robot.body_names}")
+    print(f"[Rflyarm] joints ({robot.num_joints}): {robot.joint_names}")
+    print(f"[Rflyarm] total mass: {flight.mass_kg:.6f} kg")
+    print(
+        f"[Rflyarm] timing: physics_dt={sim_dt:.9f}s "
+        f"physics_hz={1.0 / sim_dt:.3f} render_interval={RENDER_INTERVAL}"
+    )
+    print(f"[Rflyarm] initial flight-body position: {flight.state()[0][0].tolist()}")
 
-        warehouse_layer = Sdf.Layer.FindOrOpen(str(WAREHOUSE_USD))
-        if warehouse_layer is None:
-            raise RuntimeError("Failed to inspect warehouse USD: " + str(WAREHOUSE_USD))
-        vehicle_spec = warehouse_layer.GetPrimAtPath("/Root/rflyarm")
-        if vehicle_spec is None:
-            raise RuntimeError("Rflyarm has no specification in the warehouse root layer")
+    ros = None
+    if not args_cli.no_ros and not (args_cli.verify_flight or args_cli.verify_arm or args_cli.verify_rotors):
+        from simulation.ros2_interface import Ros2Interface
 
-        references = list(vehicle_spec.referenceList.prependedItems)
-        references += list(vehicle_spec.referenceList.explicitItems)
-        references += list(vehicle_spec.referenceList.appendedItems)
-        vehicle_references = [ref for ref in references if ref.assetPath]
-        if len(vehicle_references) != 1:
-            raise RuntimeError(
-                "Expected one Rflyarm asset reference, found: "
-                + str(len(vehicle_references)))
-        vehicle_usd = Sdf.ComputeAssetPathRelativeToLayer(
-            warehouse_layer, vehicle_references[0].assetPath)
-        if not Path(vehicle_usd).is_file():
-            raise FileNotFoundError(
-                "Collected Rflyarm USD not found: " + vehicle_usd)
+        ros = Ros2Interface(robot=robot, flight_controller=flight, arm_controller=arm)
 
-        self.pg.load_asset(str(WAREHOUSE_USD), WAREHOUSE_PRIM)
-        vehicle = self.world.stage.GetPrimAtPath(EMBEDDED_RFLYARM_PRIM)
-        if not vehicle.IsValid():
-            raise RuntimeError(
-                "Embedded Rflyarm prim not found at: " + EMBEDDED_RFLYARM_PRIM)
+    target = flight.target_position
+    if args_cli.verify_flight and args_cli.max_steps == 0:
+        args_cli.max_steps = 2500
+    if args_cli.verify_arm and args_cli.max_steps == 0:
+        args_cli.max_steps = 3500
+    if args_cli.verify_rotors and args_cli.max_steps == 0:
+        args_cli.max_steps = 500
 
-        transform = UsdGeom.Xformable(vehicle).ComputeLocalToWorldTransform(
-            Usd.TimeCode.Default())
-        translation = transform.ExtractTranslation()
-        orientation = transform.ExtractRotationQuat()
-        imaginary = orientation.GetImaginary()
-        init_pos = [translation[0], translation[1], translation[2]]
-        init_orientation = [
-            imaginary[0], imaginary[1], imaginary[2], orientation.GetReal()]
+    arm_test_start = 1500
+    step = 0
+    try:
+        while simulation_app.is_running():
+            if args_cli.verify_arm and step == arm_test_start:
+                arm.set_joint_target(ARM_TEST_TARGET)
+                print(f"[VERIFY][ARM] target applied at step {step}: {list(ARM_TEST_TARGET)}")
 
-        # The collected scene already contains the vehicle. Keep the source USD
-        # untouched, deactivate that referenced copy in the runtime stage, and
-        # let Pegasus spawn an identical controlled instance from the collected
-        # asset at /World/rflyarm.
-        vehicle.SetActive(False)
+            if ros is not None:
+                ros.process_commands()
 
-        carb.log_warn(
-            "[Rflyarm] loaded collected warehouse and prepared vehicle asset: "
-            + vehicle_usd)
-        return vehicle_usd, init_pos, init_orientation
+            arm.update(sim_dt)
+            wrench = flight.compute()
+            dynamics.apply_wrench(wrench)
 
-    def run(self):
-        self.timeline.play()
-        steps = 0
-        while simulation_app.is_running() and not self.stop_sim:
-            self.world.step(render=not _args.headless)
-            steps += 1
-            if _args.max_steps > 0 and steps >= _args.max_steps:
+            scene.write_data_to_sim()
+            rotor_visualizer.update(dynamics.last_applied, sim_dt)
+            sim.step()
+            scene.update(sim_dt)
+            step += 1
+            sim_time_ns = round(step * sim_dt * 1_000_000_000)
+
+            if ros is not None:
+                ros.publish_states(sim_time_ns=sim_time_ns, dt=sim_dt)
+
+            if step % 500 == 0:
+                metrics = _flight_metrics(flight, target)
+                print(
+                    "[Rflyarm] step=%d sim_time=%.3fs position=(%.3f, %.3f, %.3f) "
+                    "error=%.3f speed=%.3f tilt=%.2fdeg"
+                    % (
+                        step,
+                        sim_time_ns * 1.0e-9,
+                        metrics["x"],
+                        metrics["y"],
+                        metrics["z"],
+                        metrics["position_error"],
+                        metrics["speed"],
+                        metrics["tilt_deg"],
+                    )
+                )
+
+            if args_cli.max_steps > 0 and step >= args_cli.max_steps:
                 break
-        carb.log_warn("PegasusApp Simulation App is closing.")
-        self.timeline.stop()
-        simulation_app.close()
+    finally:
+        if ros is not None:
+            ros.shutdown()
+
+    if args_cli.verify_flight:
+        metrics = _flight_metrics(flight, target)
+        passed = (
+            metrics["position_error"] < 0.25
+            and metrics["speed"] < 0.35
+            and metrics["tilt_deg"] < 12.0
+        )
+        print(f"[VERIFY][FLIGHT] {'PASS' if passed else 'FAIL'} {metrics}")
+        if not passed:
+            raise RuntimeError("Flight verification failed")
+
+    if args_cli.verify_arm:
+        errors = arm.position_errors(ARM_TEST_TARGET)
+        metrics = _flight_metrics(flight, target)
+        max_error = float(torch.max(torch.abs(errors)).item())
+        passed = max_error < 0.03 and metrics["position_error"] < 0.35 and metrics["speed"] < 0.45
+        print(
+            f"[VERIFY][ARM] {'PASS' if passed else 'FAIL'} max_joint_error={max_error:.6f} "
+            f"errors={errors.tolist()} flight={metrics}"
+        )
+        if not passed:
+            raise RuntimeError("Arm verification failed")
+
+    if args_cli.verify_rotors:
+        cumulative = rotor_visualizer.cumulative_rotation[0]
+        position_error = rotor_visualizer.position_error()[0]
+        expected_directions = torch.tensor(
+            (-1.0, 1.0, -1.0, 1.0, -1.0, 1.0), device=robot.device
+        )
+        direction_ok = torch.all(torch.sign(cumulative) == expected_directions)
+        max_position_error = float(torch.max(torch.abs(position_error)).item())
+        min_rotation = float(torch.min(torch.abs(cumulative)).item())
+        passed = bool(direction_ok.item()) and min_rotation > 1.0 and max_position_error < 0.01
+        print(
+            f"[VERIFY][ROTORS] {'PASS' if passed else 'FAIL'} "
+            f"cumulative_rotation={cumulative.tolist()} "
+            f"min_abs_rotation={min_rotation:.3f} rad "
+            f"max_position_error={max_position_error:.6f} rad"
+        )
+        if not passed:
+            raise RuntimeError("Rotor visual verification failed")
 
 
-def main():
-    pg_app = PegasusApp()
-    pg_app.run()
+def main() -> None:
+    sim_cfg = sim_utils.SimulationCfg(
+        dt=PHYSICS_DT,
+        render_interval=RENDER_INTERVAL,
+        device=args_cli.device,
+    )
+    sim = SimulationContext(sim_cfg)
+    sim.set_camera_view(eye=(4.5, 4.5, 3.2), target=(0.0, 0.0, 1.0))
+
+    scene = InteractiveScene(RflyarmSceneCfg(num_envs=1, env_spacing=0.0))
+    sim.reset()
+    scene.update(0.0)
+    print("[Rflyarm] Isaac Lab scene setup complete")
+    run_simulator(sim, scene)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"[Rflyarm] fatal error: {exc}", file=sys.stderr)
+        raise
+    finally:
+        simulation_app.close()

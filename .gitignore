@@ -14,7 +14,7 @@ dist/
 venv/
 env/
 
-# Isaac Sim / Pegasus 运行产物
+# Isaac Sim / Isaac Lab 运行产物
 logs/
 *.log
 *.npz

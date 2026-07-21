@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """Lula FK/IK helper for the Rflyarm arm.
 
-This module deliberately contains no ROS node, Pegasus backend, or PhysX write.
-``ArmController`` owns all command arbitration and is the only component
-allowed to call ``set_dof_position_target``.  Keeping Lula as a pure numerical
-helper prevents the Cartesian and joint interfaces from fighting each other.
+This module deliberately contains no ROS node or PhysX write. ``ArmController``
+owns all command arbitration and is the only component allowed to write joint
+targets. Keeping Lula as a pure numerical helper prevents the Cartesian and
+joint interfaces from fighting each other.
 
 All poses handled here are expressed in the arm's ``base_link`` frame.  The
 solver base therefore remains at Lula's default identity pose; platform motion
@@ -14,6 +14,7 @@ in the world frame is intentionally irrelevant.
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import sys
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -39,7 +40,7 @@ class IKResult:
 
 
 class ArmKinematics:
-    """Validated FK/IK wrapper around Isaac Sim 5.1's Lula solver."""
+    """Validated FK/IK wrapper around the Lula solver bundled with Isaac Sim 6.0.1."""
 
     def __init__(
         self,
@@ -63,13 +64,15 @@ class ArmKinematics:
         self.acceptance_orientation_error_rad = float(acceptance_orientation_error_rad)
         self.safe_joint_limit_rad = float(safe_joint_limit_rad)
 
-        self._solver = None
+        self._lula = None
+        self._robot_description = None
+        self._kinematics = None
         self._lower_limits = None
         self._upper_limits = None
 
     @property
     def loaded(self) -> bool:
-        return self._solver is not None
+        return self._kinematics is not None
 
     @staticmethod
     def _as_finite_vector(values, size: int, label: str) -> np.ndarray:
@@ -102,9 +105,9 @@ class ArmKinematics:
         return position, quaternion / norm
 
     def load(self):
-        """Load and verify the Isaac Sim 5.1 Lula model on first use."""
+        """Load and verify the Isaac Sim 6.0.1 Lula model on first use."""
 
-        if self._solver is not None:
+        if self._kinematics is not None:
             return
         for path, label in (
             (self.robot_description_path, "robot description"),
@@ -113,33 +116,49 @@ class ArmKinematics:
             if not os.path.isfile(path):
                 raise FileNotFoundError("%s file not found: %s" % (label, path))
 
-        from isaacsim.robot_motion.motion_generation.lula.kinematics import (
-            LulaKinematicsSolver,
-        )
+        # Use the Lula numerical library bundled with Isaac Sim 6 directly.  This
+        # keeps FK/IK independent of the deprecated ``isaacsim.core.api`` layer.
+        isaac_sim_root = Path(sys.executable).resolve().parents[3]
+        lula_extension = isaac_sim_root / "extsDeprecated" / "isaacsim.robot_motion.lula"
+        prebundle_path = lula_extension / "pip_prebundle"
+        if not prebundle_path.exists():
+            raise FileNotFoundError(f"Isaac Sim 6 Lula component not found: {prebundle_path}")
+        prebundle = str(prebundle_path)
+        if prebundle not in sys.path:
+            sys.path.insert(0, prebundle)
+        import lula
 
-        solver = LulaKinematicsSolver(
-            robot_description_path=self.robot_description_path,
-            urdf_path=self.urdf_path,
+        robot_description = lula.load_robot(
+            self.robot_description_path, self.urdf_path
         )
-        joint_names = tuple(solver.get_joint_names())
+        kinematics = robot_description.kinematics()
+        joint_names = tuple(
+            robot_description.c_space_coord_name(index)
+            for index in range(robot_description.num_c_space_coords())
+        )
         if joint_names != ARM_JOINT_NAMES:
             raise RuntimeError(
                 "Lula cspace mismatch: expected %s, received %s" %
                 (ARM_JOINT_NAMES, joint_names))
-        frames = tuple(solver.get_all_frame_names())
+        frames = tuple(kinematics.frame_names())
         if self.base_frame not in frames or self.ee_frame not in frames:
             raise RuntimeError(
                 "Lula frames must include '%s' and '%s': %s" %
                 (self.base_frame, self.ee_frame, frames))
 
-        lower, upper = solver.get_cspace_position_limits()
-        lower = np.asarray(lower, dtype=np.float64)
-        upper = np.asarray(upper, dtype=np.float64)
+        limits = [
+            kinematics.c_space_coord_limits(index)
+            for index in range(kinematics.num_c_space_coords())
+        ]
+        lower = np.asarray([limit.lower for limit in limits], dtype=np.float64)
+        upper = np.asarray([limit.upper for limit in limits], dtype=np.float64)
         # The verified joint controller intentionally keeps every arm joint a
         # small margin inside +/-pi.  IK uses the identical executable limits.
         self._lower_limits = np.maximum(lower, -self.safe_joint_limit_rad)
         self._upper_limits = np.minimum(upper, self.safe_joint_limit_rad)
-        self._solver = solver
+        self._lula = lula
+        self._robot_description = robot_description
+        self._kinematics = kinematics
 
     def forward(self, joint_positions):
         """Return ``(position, quaternion_xyzw)`` for ``tool_center``."""
@@ -150,11 +169,12 @@ class ArmKinematics:
         """Return a named Lula frame pose relative to ``base_link``."""
 
         self.load()
-        if str(frame_name) not in self._solver.get_all_frame_names():
+        if str(frame_name) not in self._kinematics.frame_names():
             raise ValueError("unknown Lula frame: %s" % frame_name)
         joints = self._as_finite_vector(joint_positions, 6, "joint_positions")
-        position, rotation = self._solver.compute_forward_kinematics(
-            str(frame_name), joints)
+        pose = self._kinematics.pose(np.expand_dims(joints, 1), str(frame_name))
+        position = pose.translation
+        rotation = pose.rotation.matrix()
         position = self._as_finite_vector(position, 3, "FK position")
         rotation = np.asarray(rotation, dtype=np.float64)
         if rotation.shape != (3, 3) or not np.all(np.isfinite(rotation)):
@@ -197,20 +217,25 @@ class ArmKinematics:
             if not any(np.linalg.norm(seed - item) < 1.0e-9 for item in seeds):
                 seeds.append(seed)
 
-        # Isaac/Lula quaternions are scalar-first; ROS/scipy are scalar-last.
-        target_quaternion_wxyz = target_quaternion[[3, 0, 1, 2]]
         valid_results = []
         failure_notes = []
         for seed in seeds:
             try:
-                candidate, success = self._solver.compute_inverse_kinematics(
-                    frame_name=self.ee_frame,
-                    target_position=target_position,
-                    target_orientation=target_quaternion_wxyz,
-                    warm_start=seed,
-                    position_tolerance=self.solver_position_tolerance_m,
-                    orientation_tolerance=self.solver_orientation_tolerance_rad,
+                target_rotation = Rotation.from_quat(target_quaternion).as_matrix()
+                target_pose = self._lula.Pose3(
+                    self._lula.Rotation3(target_rotation), target_position
                 )
+                config = self._lula.CyclicCoordDescentIkConfig()
+                config.position_tolerance = self.solver_position_tolerance_m
+                config.orientation_tolerance = 2.0 * np.sin(
+                    0.5 * self.solver_orientation_tolerance_rad
+                )
+                config.cspace_seeds = [seed]
+                solver_result = self._lula.compute_ik_ccd(
+                    self._kinematics, target_pose, self.ee_frame, config
+                )
+                candidate = solver_result.cspace_position
+                success = solver_result.success
             except Exception as exc:
                 failure_notes.append("solver exception: %s" % exc)
                 continue
