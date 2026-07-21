@@ -37,19 +37,19 @@ ros2 topic echo /arm/ee_pose
 
 # 飞行目标：map 坐标系，位置单位 m
 ros2 topic pub --once /drone/cmd_pose geometry_msgs/msg/PoseStamped \
-  '{header: {frame_id: "map"}, pose: {position: {x: 0.0, y: 0.0, z: 2.0}, orientation: {w: 1.0}}}'
+  '{header: {frame_id: "map"}, pose: {position: {x: 0.0, y: 0.0, z: 5.5}, orientation: {w: 1.0}}}'
 
 # 六个机械臂关节，单位 rad
 ros2 topic pub --once /joint_command sensor_msgs/msg/JointState \
   '{name: ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"], position: [0.0, -0.5, 0.5, 0.0, 0.5, 0.0]}'
 
-# 单自由度夹爪：0 rad 张开，0.5 rad 闭合
+# 单自由度夹爪：1.0 张开，0.0 闭合
 ros2 topic pub --once /joint_command sensor_msgs/msg/JointState \
-  '{name: ["gripper"], position: [0.5]}'
+  '{name: ["gripper"], position: [0.0]}'
 
 # 机械臂末端全位姿
 ros2 topic pub --once /arm/cmd_pose geometry_msgs/msg/PoseStamped \
-  '{header: {frame_id: "base_link"}, pose: {position: {x: 0.0, y: 0.0, z: 0.6}, orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}'
+  '{header: {frame_id: "base_link"}, pose: {position: {x: 0.05, y: 0.0, z: 0.42}, orientation: {x: 0.0, y: 0.0, z: 0.707, w: 0.707}}}'
 ```
 
 | 方向 | 话题 | 类型 | 说明 |

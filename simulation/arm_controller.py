@@ -35,7 +35,7 @@ class ArmController:
         if gripper_names != [GRIPPER_MASTER_NAME]:
             raise RuntimeError(f"Gripper master joint not found: {gripper_names}")
         self.gripper_id = torch.tensor(gripper_ids, device=self.device, dtype=torch.int32)
-        self.gripper_target = self._all_positions()[:, self.gripper_id].clone()
+        self.gripper_target = torch.full_like(self._all_positions()[:, self.gripper_id], 0.5)
         self.kinematics = ArmKinematics()
         self.last_ik_solution = None
 
@@ -62,7 +62,8 @@ class ArmController:
             if name in ARM_JOINT_NAMES:
                 self.target[:, ARM_JOINT_NAMES.index(name)] = float(position)
             elif name == "gripper":
-                self.gripper_target[:] = float(max(0.0, min(0.5, position)))
+                command = max(0.0, min(1.0, float(position)))
+                self.gripper_target[:] = -1.0 + 1.5 * command
             else:
                 raise ValueError(f"Unknown joint name: {name}")
 
@@ -110,8 +111,9 @@ class ArmController:
             efforts = torch.zeros_like(positions)
         ids = self.joint_ids.to(dtype=torch.long)
         gripper_id = self.gripper_id.to(dtype=torch.long)
+        gripper_position = torch.clamp((positions[gripper_id] + 1.0) / 1.5, 0.0, 1.0)
         public_names = ARM_JOINT_NAMES + ["gripper"]
-        public_positions = torch.cat((positions[ids], positions[gripper_id]))
+        public_positions = torch.cat((positions[ids], gripper_position))
         public_velocities = torch.cat((velocities[ids], velocities[gripper_id]))
         public_efforts = torch.cat((efforts[ids], efforts[gripper_id]))
         return (
