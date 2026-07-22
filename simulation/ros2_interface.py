@@ -6,6 +6,8 @@ import math
 from pathlib import Path
 import sys
 
+import numpy as np
+
 # This project uses rclpy directly and does not create OmniGraph bridge nodes.
 # The launcher has already selected Isaac Sim's matching ROS libraries; expose
 # its Python 3.12 message/rclpy packages without enabling renderer-heavy UI
@@ -20,21 +22,38 @@ if str(ros_python_path) not in sys.path:
 
 import rclpy
 from builtin_interfaces.msg import Time
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rosgraph_msgs.msg import Clock
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import CameraInfo, Image, JointState
+from tf2_msgs.msg import TFMessage
+
+
+BODY_FRAME = "body"
+DEPTH_CAMERA_FRAME = "depth_camera_optical_frame"
 
 
 class Ros2Interface:
     """Expose the stable Rflyarm ROS 2 API without OmniGraph or Pegasus."""
 
-    def __init__(self, robot, flight_controller, arm_controller, publish_hz: float = 60.0):
+    def __init__(
+        self,
+        robot,
+        flight_controller,
+        arm_controller,
+        depth_camera=None,
+        publish_hz: float = 60.0,
+        camera_publish_hz: float = 15.0,
+    ):
         self.robot = robot
         self.flight = flight_controller
         self.arm = arm_controller
+        self.depth_camera = depth_camera
         self.publish_period = 1.0 / max(float(publish_hz), 1.0)
         self.publish_accumulator = 0.0
+        self.camera_publish_period = 1.0 / max(float(camera_publish_hz), 1.0)
+        self.camera_publish_accumulator = 0.0
+        self.last_camera_frame = -1
         self.last_sim_time_ns = -1
 
         if not rclpy.ok():
@@ -57,14 +76,50 @@ class Ros2Interface:
             durability=DurabilityPolicy.VOLATILE,
         )
         self.clock_publisher = self.node.create_publisher(Clock, "/clock", clock_qos)
+        camera_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=2,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.depth_image_publisher = self.node.create_publisher(
+            Image, "/depth_camera/depth/image_raw", camera_qos
+        )
+        self.color_image_publisher = self.node.create_publisher(
+            Image, "/depth_camera/color/image_raw", camera_qos
+        )
+        self.color_camera_info_publisher = self.node.create_publisher(
+            CameraInfo, "/depth_camera/color/camera_info", camera_qos
+        )
+        self.depth_camera_info_publisher = self.node.create_publisher(
+            CameraInfo, "/depth_camera/depth/camera_info", camera_qos
+        )
+        tf_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        static_tf_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.tf_publisher = self.node.create_publisher(TFMessage, "/tf", tf_qos)
+        self.tf_static_publisher = self.node.create_publisher(
+            TFMessage, "/tf_static", static_tf_qos
+        )
         self.node.create_subscription(PoseStamped, "/drone/cmd_pose", self._flight_command_callback, qos)
         self.node.create_subscription(JointState, "/joint_command", self._joint_command_callback, qos)
         self.node.create_subscription(PoseStamped, "/arm/cmd_pose", self._arm_pose_callback, qos)
 
         # Fail fast if the project-local URDF/Lula model cannot be used.
         self.arm.kinematics.load()
+        self._publish_camera_static_tf()
         self.node.get_logger().info(
-            "Rflyarm ROS 2 ready: /drone/cmd_pose, /joint_command, /arm/cmd_pose, /clock"
+            "Rflyarm ROS 2 ready: controls, state, /depth_camera/color/image_raw, "
+            "/depth_camera/depth/image_raw, camera_info, /tf"
         )
 
     @staticmethod
@@ -130,11 +185,19 @@ class Ros2Interface:
             )
         self.last_sim_time_ns = sim_time_ns
         self.publish_accumulator += max(float(dt), 0.0)
+        self.camera_publish_accumulator += max(float(dt), 0.0)
+        if (
+            self.depth_camera is not None
+            and self.camera_publish_accumulator >= self.camera_publish_period
+        ):
+            self.camera_publish_accumulator %= self.camera_publish_period
+            self._publish_camera_images(sim_time_ns)
         if self.publish_accumulator < self.publish_period:
             return
         self.publish_accumulator %= self.publish_period
         self._publish_clock(sim_time_ns)
         self._publish_drone_pose(sim_time_ns)
+        self._publish_body_tf(sim_time_ns)
         self._publish_joint_states(sim_time_ns)
         self._publish_ee_pose(sim_time_ns)
 
@@ -165,6 +228,116 @@ class Ros2Interface:
             message.pose.orientation.w,
         ) = (float(value) for value in quaternion[0].tolist())
         self.drone_pose_publisher.publish(message)
+
+    def _publish_body_tf(self, sim_time_ns: int) -> None:
+        position, quaternion, _linear_velocity, _angular_velocity = self.flight.state()
+        transform = TransformStamped()
+        transform.header.stamp = self._stamp(sim_time_ns)
+        transform.header.frame_id = "map"
+        transform.child_frame_id = BODY_FRAME
+        transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z = (
+            float(value) for value in position[0].tolist()
+        )
+        (
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w,
+        ) = (float(value) for value in quaternion[0].tolist())
+        message = TFMessage()
+        message.transforms = [transform]
+        self.tf_publisher.publish(message)
+
+    def _publish_camera_static_tf(self) -> None:
+        if self.depth_camera is None:
+            return
+        offset = self.depth_camera.cfg.offset
+        transform = TransformStamped()
+        transform.header.stamp = self._stamp(0)
+        transform.header.frame_id = BODY_FRAME
+        transform.child_frame_id = DEPTH_CAMERA_FRAME
+        (
+            transform.transform.translation.x,
+            transform.transform.translation.y,
+            transform.transform.translation.z,
+        ) = (float(value) for value in offset.pos)
+        (
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w,
+        ) = (float(value) for value in offset.rot)
+        message = TFMessage()
+        message.transforms = [transform]
+        self.tf_static_publisher.publish(message)
+
+    def _publish_camera_images(self, sim_time_ns: int) -> None:
+        camera_data = self.depth_camera.data
+        frame = int(self.depth_camera.frame.torch[0].item())
+        if frame == self.last_camera_frame:
+            return
+        self.last_camera_frame = frame
+
+        rgb_tensor = camera_data.output["rgb"].torch[0]
+        rgb = np.ascontiguousarray(rgb_tensor.detach().cpu().numpy(), dtype=np.uint8)
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise RuntimeError(f"Unexpected RGB image shape: {rgb.shape}")
+
+        depth_tensor = camera_data.output["distance_to_image_plane"].torch[0]
+        if depth_tensor.ndim == 3 and depth_tensor.shape[-1] == 1:
+            depth_tensor = depth_tensor[..., 0]
+        depth = np.ascontiguousarray(depth_tensor.detach().cpu().numpy(), dtype=np.float32)
+        height, width = depth.shape
+        stamp = self._stamp(sim_time_ns)
+
+        color_image = Image()
+        color_image.header.stamp = stamp
+        color_image.header.frame_id = DEPTH_CAMERA_FRAME
+        color_image.height = height
+        color_image.width = width
+        color_image.encoding = "rgb8"
+        color_image.is_bigendian = False
+        color_image.step = width * 3
+        color_image.data = rgb.tobytes()
+        self.color_image_publisher.publish(color_image)
+
+        depth_image = Image()
+        depth_image.header.stamp = stamp
+        depth_image.header.frame_id = DEPTH_CAMERA_FRAME
+        depth_image.height = height
+        depth_image.width = width
+        depth_image.encoding = "32FC1"
+        depth_image.is_bigendian = False
+        depth_image.step = width * 4
+        depth_image.data = depth.tobytes()
+        self.depth_image_publisher.publish(depth_image)
+
+        intrinsic = camera_data.intrinsic_matrices.torch[0].detach().cpu().numpy()
+        info = CameraInfo()
+        info.header.stamp = stamp
+        info.header.frame_id = DEPTH_CAMERA_FRAME
+        info.height = height
+        info.width = width
+        info.distortion_model = "plumb_bob"
+        info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
+        info.k = intrinsic.reshape(-1).astype(float).tolist()
+        info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        info.p = [
+            float(intrinsic[0, 0]),
+            0.0,
+            float(intrinsic[0, 2]),
+            0.0,
+            0.0,
+            float(intrinsic[1, 1]),
+            float(intrinsic[1, 2]),
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+        ]
+        self.color_camera_info_publisher.publish(info)
+        self.depth_camera_info_publisher.publish(info)
 
     def _publish_joint_states(self, sim_time_ns: int) -> None:
         names, positions, velocities, efforts = self.arm.joint_state()

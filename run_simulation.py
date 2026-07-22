@@ -24,6 +24,9 @@ if args_cli.physics_hz <= 0.0:
 if args_cli.render_hz <= 0.0:
     parser.error("--render-hz must be positive")
 
+# The scene always contains an RTX depth camera. Enable camera rendering before
+# AppLauncher creates Kit, including when callers omit --enable_cameras.
+args_cli.enable_cameras = True
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -97,7 +100,12 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene) -> None:
     if not args_cli.no_ros and not (args_cli.verify_flight or args_cli.verify_arm or args_cli.verify_rotors):
         from simulation.ros2_interface import Ros2Interface
 
-        ros = Ros2Interface(robot=robot, flight_controller=flight, arm_controller=arm)
+        ros = Ros2Interface(
+            robot=robot,
+            flight_controller=flight,
+            arm_controller=arm,
+            depth_camera=scene["depth_camera"],
+        )
 
     target = flight.target_position
     if args_cli.verify_flight and args_cli.max_steps == 0:

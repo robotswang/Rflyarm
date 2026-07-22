@@ -6,6 +6,7 @@
 # Rflyarm
 
 Rflyarm 是基于 Isaac Sim 6.0.1 和 Isaac Lab 3.0.0 Beta 2 的六旋翼飞行机械臂室内仿真平台。
+场景在墙面与天花板间设有 45°、6.0 × 3.2 m 的附着测试斜面。
 
 ## 安装
 
@@ -23,34 +24,12 @@ cd ~/Rflyarm
 ```
 
 平台启动后会闭环飞往 `map` 坐标系下的 `(0, 0, 1.5)` m 并悬停。
+运行 `./replace_bulb.sh` 可启动自动换灯泡演示。
+运行 `./attach_inclined.sh` 可启动斜面附着测试。
 
 ## ROS 2 控制
 
 仿真端由 `run_simulation.sh` 自动使用 Isaac Sim 自带的 ROS 2 Humble Python 3.12 环境。
-
-```bash
-# 状态
-ros2 topic echo /clock
-ros2 topic echo /drone/pose
-ros2 topic echo /joint_states
-ros2 topic echo /arm/ee_pose
-
-# 飞行目标：map 坐标系，位置单位 m
-ros2 topic pub --once /drone/cmd_pose geometry_msgs/msg/PoseStamped \
-  '{header: {frame_id: "map"}, pose: {position: {x: 0.0, y: 0.0, z: 5.5}, orientation: {w: 1.0}}}'
-
-# 六个机械臂关节，单位 rad
-ros2 topic pub --once /joint_command sensor_msgs/msg/JointState \
-  '{name: ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"], position: [0.0, -0.5, 0.5, 0.0, 0.5, 0.0]}'
-
-# 单自由度夹爪：1.0 张开，0.0 闭合
-ros2 topic pub --once /joint_command sensor_msgs/msg/JointState \
-  '{name: ["gripper"], position: [0.0]}'
-
-# 机械臂末端全位姿
-ros2 topic pub --once /arm/cmd_pose geometry_msgs/msg/PoseStamped \
-  '{header: {frame_id: "base_link"}, pose: {position: {x: 0.05, y: 0.0, z: 0.42}, orientation: {x: 0.0, y: 0.0, z: 0.707, w: 0.707}}}'
-```
 
 | 方向 | 话题 | 类型 | 说明 |
 |---|---|---|---|
@@ -61,6 +40,9 @@ ros2 topic pub --once /arm/cmd_pose geometry_msgs/msg/PoseStamped \
 | 输出 | `/drone/pose` | `geometry_msgs/msg/PoseStamped` | `map` 下的无人机位置与四元数姿态 |
 | 输出 | `/joint_states` | `sensor_msgs/msg/JointState` | 关节位置、速度和力/力矩 |
 | 输出 | `/arm/ee_pose` | `geometry_msgs/msg/PoseStamped` | Lula FK 计算的 `tool_center` 位姿 |
+| 输出 | `/depth_camera/{color,depth}/image_raw` | `sensor_msgs/msg/Image` | 320×240 RGB 与 32FC1 深度图（15 Hz） |
+| 输出 | `/depth_camera/{color,depth}/camera_info` | `sensor_msgs/msg/CameraInfo` | 相机内参 |
+| 输出 | `/tf`、`/tf_static` | `tf2_msgs/msg/TFMessage` | `map → body → depth_camera_optical_frame` |
 
 需要使用 ROS 定时器的外部节点应设置参数 `use_sim_time:=true`；状态消息的
 `header.stamp` 与 `/clock` 均使用仿真时间，界面运行速度则由墙钟时间单独衡量。
@@ -70,9 +52,11 @@ ros2 topic pub --once /arm/cmd_pose geometry_msgs/msg/PoseStamped \
 ```text
 Rflyarm/
 ├── run_simulation.sh             # 唯一启动入口与运行环境配置
+├── replace_bulb.sh               # 自动换灯泡演示
+├── attach_inclined.sh            # 斜面附着测试
 ├── run_simulation.py             # Isaac Lab 仿真主循环
 ├── simulation/
-│   ├── scene.py                  # 场景与机器人加载配置
+│   ├── scene.py                  # 场景、机器人与深度相机配置
 │   ├── flight_controller.py      # 六旋翼飞行控制器
 │   ├── aerial_manipulator.py     # 推力与力矩动力学
 │   ├── arm_controller.py         # 机械臂和夹爪控制
@@ -85,6 +69,7 @@ Rflyarm/
 │   │   └── SubUSDs/
 │   │       ├── World.usd         # 仿真实际加载的组合场景
 │   │       ├── simple_room.usd   # SimpleRoom 环境
+│   │       ├── inclined_panel.usda # 斜面附着测试板
 │   │       ├── target_bulb.usd   # 目标灯泡
 │   │       └── rflyarm.usda      # 飞行机械臂
 │   └── kinematics/
