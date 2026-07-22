@@ -18,28 +18,30 @@ wait_sim_time() {
         --filter "m.clock.sec + m.clock.nanosec / 1e9 >= $1" >/dev/null
 }
 
-# Move below and in front of the inclined panel while opening the gripper.
 wait_sim_time 1
 ros2 topic pub --once /drone/cmd_pose geometry_msgs/msg/PoseStamped \
-    '{header: {frame_id: "map"}, pose: {position: {x: 0.0, y: -4.46, z: 6.20}, orientation: {w: 1.0}}}' &
-drone_pub_pid=$!
+  '{header: {frame_id: "map"}, pose: {position: {x: 0.04, y: -5.03, z: 7.05}, orientation: {w: 1.0}}}'
 ros2 topic pub --once /joint_command sensor_msgs/msg/JointState \
-    '{name: ["gripper"], position: [1.0]}' &
-gripper_pub_pid=$!
-wait "$drone_pub_pid" "$gripper_pub_pid"
+    '{name: ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"], position: [-1.527817011, -1.492991328, 1.358749747, -0.897547543, -1.027395606, -0.012855814]}'
 
-# Align the tool Z axis with the 45-degree panel normal before approaching.
-wait_sim_time 10
-ros2 topic pub --once /arm/cmd_pose geometry_msgs/msg/PoseStamped \
-    '{header: {frame_id: "base_link"}, pose: {position: {x: 0.0, y: -0.44, z: 0.46}, orientation: {x: 0.3826834324, y: 0.0, z: 0.0, w: 0.9238795325}}}'
-
-# Advance until the tool center reaches the underside center of the panel.
-wait_sim_time 13
+wait_sim_time 15
 ros2 topic pub --once /drone/cmd_pose geometry_msgs/msg/PoseStamped \
-    '{header: {frame_id: "map"}, pose: {position: {x: 0.0, y: -4.937, z: 6.657}, orientation: {w: 1.0}}}'
+  '{header: {frame_id: "map"}, pose: {position: {x: 0.04, y: -5.03, z: 100.0}, orientation: {w: 1.0}}}'
 
-wait_sim_time 17
+wait_sim_time 15.5
+ros2 topic pub --once /drone/cmd_pose geometry_msgs/msg/PoseStamped \
+  '{header: {frame_id: "map"}, pose: {position: {x: 0.04, y: -50.0, z: 100.0}, orientation: {w: 1.0}}}'
+
+wait_sim_time 16
+ros2 topic pub --once /arm/cmd_pose geometry_msgs/msg/PoseStamped \
+    '{header: {frame_id: "base_link"}, pose: {position: {x: 0.03, y: 0.0, z: 0.28}, orientation: {x: 0.0, y: 0.0, z: 0.707, w: 0.707}}}'
+
+wait_sim_time 16.5
 ros2 topic pub --once /joint_command sensor_msgs/msg/JointState \
     '{name: ["gripper"], position: [0.0]}'
+
+wait_sim_time 17
+ros2 topic pub --once /drone/cmd_pose geometry_msgs/msg/PoseStamped \
+  '{header: {frame_id: "map"}, pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {w: 1.0}}}'
 
 wait "$sim_pid"

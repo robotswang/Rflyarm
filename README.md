@@ -6,7 +6,6 @@
 # Rflyarm
 
 Rflyarm 是基于 Isaac Sim 6.0.1 和 Isaac Lab 3.0.0 Beta 2 的六旋翼飞行机械臂室内仿真平台。
-场景在墙面与天花板间设有 45°、6.0 × 3.2 m 的附着测试斜面。
 
 ## 安装
 
@@ -25,7 +24,7 @@ cd ~/Rflyarm
 
 平台启动后会闭环飞往 `map` 坐标系下的 `(0, 0, 1.5)` m 并悬停。
 运行 `./replace_bulb.sh` 可启动自动换灯泡演示。
-运行 `./attach_inclined.sh` 可启动斜面附着测试。
+运行 `./attach_inclined.sh` 可启动斜面附着测试，并在仿真 7 s 时飞往 `(0, -7, 7)` m。
 
 ## ROS 2 控制
 
