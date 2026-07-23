@@ -19,16 +19,20 @@ git clone https://github.com/robotswang/Rflyarm.git
 
 ```bash
 cd ~/Rflyarm
-./run_simulation.sh
+./run_simulation.py
 ```
 
 平台启动后会闭环飞往 `map` 坐标系下的 `(0, 0, 1.5)` m 并悬停。
-运行 `./replace_bulb.sh` 可启动自动换灯泡演示。
-运行 `./attach_inclined.sh` 可启动斜面附着测试，并在仿真 7 s 时飞往 `(0, -7, 7)` m。
+运行 `./replace_bulb.py` 可启动自动换灯泡演示。
+拆卸演示输出完成提示后保持其进程运行，再在另一终端运行 `./install_bulb.py`，
+将夹爪中已经取下的灯泡重新安装。
+
+运行 `./attach_inclined.py` 可启动斜面附着测试。
 
 ## ROS 2 控制
 
-仿真端由 `run_simulation.sh` 自动使用 Isaac Sim 自带的 ROS 2 Humble Python 3.12 环境。
+仿真端由 `run_simulation.py` 自动切换到 Isaac Lab，并使用 Isaac Sim 自带的
+ROS 2 Humble Python 3.12 环境。
 
 | 方向 | 话题 | 类型 | 说明 |
 |---|---|---|---|
@@ -50,10 +54,10 @@ cd ~/Rflyarm
 
 ```text
 Rflyarm/
-├── run_simulation.sh             # 唯一启动入口与运行环境配置
-├── replace_bulb.sh               # 自动换灯泡演示
-├── attach_inclined.sh            # 斜面附着测试
-├── run_simulation.py             # Isaac Lab 仿真主循环
+├── run_simulation.py             # 唯一启动入口、环境自举与 Isaac Lab 仿真主循环
+├── replace_bulb.py               # Python ROS 2 自动换灯泡状态机
+├── install_bulb.py               # 连接现有仿真的灯泡重新安装状态机
+├── attach_inclined.py            # Python ROS 2 斜面附着状态机
 ├── simulation/
 │   ├── scene.py                  # 场景、机器人与深度相机配置
 │   ├── flight_controller.py      # 六旋翼飞行控制器

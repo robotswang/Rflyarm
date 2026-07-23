@@ -4,6 +4,81 @@
 from __future__ import annotations
 
 import argparse
+import os
+from pathlib import Path
+import sys
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = PROJECT_DIR.parent
+ISAACLAB_DIR = Path(
+    os.environ.get("ISAACLAB_PATH", str(WORKSPACE_DIR / "IsaacLab"))
+).expanduser().resolve()
+ISAACSIM_DIR = Path(
+    os.environ.get("ISAACSIM_PATH", str(WORKSPACE_DIR / "isaacsim"))
+).expanduser().resolve()
+ISAACLAB_LAUNCHER = ISAACLAB_DIR / "isaaclab.sh"
+ISAACSIM_ROS_SETUP = ISAACSIM_DIR / "setup_ros_env.sh"
+BOOTSTRAP_MARKER = "RFLYARM_ISAACLAB_BOOTSTRAPPED"
+
+
+def _visualizer_selected(arguments: list[str]) -> bool:
+    return any(
+        argument in ("--viz", "--visualizer", "--headless")
+        or argument.startswith("--viz=")
+        or argument.startswith("--visualizer=")
+        for argument in arguments
+    )
+
+
+def _bootstrap_isaaclab() -> None:
+    """Re-exec this file through Isaac Lab with the matching ROS libraries."""
+
+    if os.environ.get(BOOTSTRAP_MARKER) == "1":
+        return
+    if not ISAACLAB_LAUNCHER.is_file() or not os.access(ISAACLAB_LAUNCHER, os.X_OK):
+        raise FileNotFoundError(f"Isaac Lab launcher not found: {ISAACLAB_LAUNCHER}")
+    if not ISAACSIM_ROS_SETUP.is_file():
+        raise FileNotFoundError(
+            f"Isaac Sim ROS environment not found: {ISAACSIM_ROS_SETUP}"
+        )
+
+    environment = os.environ.copy()
+    for name in (
+        "PYTHONPATH",
+        "ROS_DISTRO",
+        "AMENT_PREFIX_PATH",
+        "COLCON_PREFIX_PATH",
+        "RMW_IMPLEMENTATION",
+        "LD_LIBRARY_PATH",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+    ):
+        environment.pop(name, None)
+    environment[BOOTSTRAP_MARKER] = "1"
+
+    simulation_arguments = list(sys.argv[1:])
+    if not _visualizer_selected(simulation_arguments):
+        simulation_arguments[:0] = ["--viz", "kit"]
+
+    # setup_ros_env.sh must be sourced because it exports the ROS library
+    # paths used by Isaac Sim's Python 3.12 process. The shell is only an
+    # internal bootstrap step; run_simulation.py remains the public entrypoint.
+    command = [
+        "/usr/bin/bash",
+        "-c",
+        'set -e; source "$1"; shift; exec "$@"',
+        "run_simulation.py",
+        str(ISAACSIM_ROS_SETUP),
+        str(ISAACLAB_LAUNCHER),
+        "-p",
+        str(Path(__file__).resolve()),
+        *simulation_arguments,
+    ]
+    os.execve(command[0], command, environment)
+
+
+_bootstrap_isaaclab()
 
 from isaaclab.app import AppLauncher
 
@@ -14,6 +89,11 @@ parser.add_argument("--target-altitude", type=float, default=1.5, help="Default 
 parser.add_argument("--verify-flight", action="store_true", help="Run a deterministic flight-platform acceptance test.")
 parser.add_argument("--verify-arm", action="store_true", help="Run the arm acceptance test while holding hover.")
 parser.add_argument("--verify-rotors", action="store_true", help="Verify visual rotor synchronization.")
+parser.add_argument(
+    "--verify-ceiling-bulb",
+    action="store_true",
+    help="Verify the ceiling-only passive bulb joint and software release.",
+)
 parser.add_argument("--no-ros", action="store_true", help="Disable ROS 2 even in the interactive run.")
 parser.add_argument("--physics-hz", type=float, default=250.0, help="Physics update frequency in Hz.")
 parser.add_argument("--render-hz", type=float, default=60.0, help="Maximum visual render frequency in Hz.")
@@ -32,9 +112,8 @@ simulation_app = app_launcher.app
 
 
 import math
-import sys
-
 import torch
+from pxr import Gf, UsdGeom
 
 import isaaclab.sim as sim_utils
 from isaaclab.scene import InteractiveScene
@@ -42,6 +121,11 @@ from isaaclab.sim import SimulationContext
 
 from simulation.aerial_manipulator import AerialManipulatorDynamics
 from simulation.arm_controller import ArmController
+from simulation.ceiling_bulb import (
+    CeilingBulbMechanism,
+    CeilingBulbState,
+    define_ceiling_bulb_joint,
+)
 from simulation.flight_controller import FlightController
 from simulation.rotor_visualizer import RotorVisualizer
 from simulation.scene import RflyarmSceneCfg
@@ -51,6 +135,72 @@ PHYSICS_DT = 1.0 / args_cli.physics_hz
 RENDER_INTERVAL = max(1, round(args_cli.physics_hz / args_cli.render_hz))
 FLIGHT_TARGET_XY = (0.0, 0.0)
 ARM_TEST_TARGET = (0.20, -0.50, 0.45, 0.10, 0.35, -0.20)
+
+
+def _add_grasp_point_marker(stage):
+    """Add a non-physical red sphere at the Lula tool_center grasp point."""
+    path = "/World/grasp_point_marker"
+    sphere = UsdGeom.Sphere.Define(stage, path)
+    sphere.GetRadiusAttr().Set(0.012)
+    sphere.GetDisplayColorAttr().Set([Gf.Vec3f(1.0, 0.05, 0.02)])
+    sphere.GetDisplayOpacityAttr().Set([1.0])
+    xform = UsdGeom.Xformable(sphere.GetPrim())
+    translate_op = xform.AddTranslateOp()
+    return translate_op
+
+
+def _update_grasp_point_marker(robot, translate_op) -> None:
+    """Explicitly follow Link6 world pose (Fabric does not propagate USD children)."""
+    link6_id, names = robot.find_bodies(["Link6"], preserve_order=True)
+    if names != ["Link6"]:
+        return
+    pos = robot.data.body_pos_w[0, link6_id[0]].detach().cpu().tolist()
+    quat = robot.data.body_quat_w[0, link6_id[0]].detach().cpu().tolist()
+    x, y, z, w = quat
+    # Keep the visualization marker aligned with the IK/FK tool_center frame.
+    ox, oy, oz = 0.0004, 0.0070, 0.1552
+    # Rotate local grasp-point offset by Link6 quaternion.
+    tx = (1 - 2*(y*y + z*z))*ox + 2*(x*y - z*w)*oy + 2*(x*z + y*w)*oz
+    ty = 2*(x*y + z*w)*ox + (1 - 2*(x*x + z*z))*oy + 2*(y*z - x*w)*oz
+    tz = 2*(x*z - y*w)*ox + 2*(y*z + x*w)*oy + (1 - 2*(x*x + y*y))*oz
+    translate_op.Set(Gf.Vec3d(pos[0] + tx, pos[1] + ty, pos[2] + tz))
+
+
+def _add_ceiling_angle_markers(stage):
+    markers = {}
+    colors = {"locked": (0.1, 1.0, 0.1), "release": (1.0, 0.1, 0.1), "current": (1.0, 0.8, 0.05)}
+    for name, color in colors.items():
+        sphere = UsdGeom.Sphere.Define(stage, f"/World/ceiling_{name}_point")
+        sphere.GetRadiusAttr().Set(0.008)
+        sphere.GetDisplayColorAttr().Set([Gf.Vec3f(*color)])
+        markers[name] = {
+            "translate": UsdGeom.Xformable(sphere.GetPrim()).AddTranslateOp(),
+            "imageable": UsdGeom.Imageable(sphere.GetPrim()),
+        }
+    return markers
+
+
+def _update_ceiling_angle_markers(scene, markers, angle_rad, show_current=True):
+    socket = scene["ceiling_socket"]
+    pos = socket.data.root_pos_w[0].detach().cpu().tolist()
+    quat = socket.data.root_quat_w[0].detach().cpu().tolist()
+    x, y, z, w = quat
+    def world_point(local):
+        ox, oy, oz = local
+        tx = (1-2*(y*y+z*z))*ox + 2*(x*y-z*w)*oy + 2*(x*z+y*w)*oz
+        ty = 2*(x*y+z*w)*ox + (1-2*(x*x+z*z))*oy + 2*(y*z-x*w)*oz
+        tz = 2*(x*z-y*w)*ox + 2*(y*z+x*w)*oy + (1-2*(x*x+y*y))*oz
+        return Gf.Vec3d(pos[0]+tx, pos[1]+ty, pos[2]+tz)
+    radius, height = 0.045, 0.025
+    markers["locked"]["translate"].Set(world_point((radius, 0.0, height)))
+    markers["release"]["translate"].Set(world_point((-radius, 0.0, height)))
+    current = markers["current"]
+    current["translate"].Set(
+        world_point((radius * math.cos(angle_rad), radius * math.sin(angle_rad), height)))
+    if show_current:
+        current["imageable"].MakeVisible()
+    else:
+        current["imageable"].MakeInvisible()
 
 
 def _flight_metrics(flight: FlightController, target: torch.Tensor) -> dict[str, float]:
@@ -74,8 +224,14 @@ def _flight_metrics(flight: FlightController, target: torch.Tensor) -> dict[str,
     }
 
 
-def run_simulator(sim: SimulationContext, scene: InteractiveScene) -> None:
+def run_simulator(
+    sim: SimulationContext,
+    scene: InteractiveScene,
+    ceiling_bulb: CeilingBulbMechanism,
+) -> None:
     robot = scene["rflyarm"]
+    grasp_point_marker = _add_grasp_point_marker(sim.stage)
+    ceiling_angle_markers = _add_ceiling_angle_markers(sim.stage)
     sim_dt = sim.get_physics_dt()
 
     flight = FlightController(
@@ -97,13 +253,19 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene) -> None:
     print(f"[Rflyarm] initial flight-body position: {flight.state()[0][0].tolist()}")
 
     ros = None
-    if not args_cli.no_ros and not (args_cli.verify_flight or args_cli.verify_arm or args_cli.verify_rotors):
+    if not args_cli.no_ros and not (
+        args_cli.verify_flight
+        or args_cli.verify_arm
+        or args_cli.verify_rotors
+        or args_cli.verify_ceiling_bulb
+    ):
         from simulation.ros2_interface import Ros2Interface
 
         ros = Ros2Interface(
             robot=robot,
             flight_controller=flight,
             arm_controller=arm,
+            ceiling_bulb=ceiling_bulb,
             depth_camera=scene["depth_camera"],
         )
 
@@ -114,6 +276,8 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene) -> None:
         args_cli.max_steps = 3500
     if args_cli.verify_rotors and args_cli.max_steps == 0:
         args_cli.max_steps = 500
+    if args_cli.verify_ceiling_bulb and args_cli.max_steps == 0:
+        args_cli.max_steps = 1700
 
     arm_test_start = 1500
     step = 0
@@ -134,6 +298,14 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene) -> None:
             rotor_visualizer.update(dynamics.last_applied, sim_dt)
             sim.step()
             scene.update(sim_dt)
+            _update_grasp_point_marker(robot, grasp_point_marker)
+            ceiling_bulb.update(sim_dt)
+            _update_ceiling_angle_markers(
+                scene,
+                ceiling_angle_markers,
+                ceiling_bulb._wrapped_angle(),
+                show_current=ceiling_bulb.progress.state is not CeilingBulbState.UNLOCKED,
+            )
             step += 1
             sim_time_ns = round(step * sim_dt * 1_000_000_000)
 
@@ -205,6 +377,29 @@ def run_simulator(sim: SimulationContext, scene: InteractiveScene) -> None:
         if not passed:
             raise RuntimeError("Rotor visual verification failed")
 
+    if args_cli.verify_ceiling_bulb:
+        joint_enabled = bool(ceiling_bulb.joint.GetJointEnabledAttr().Get())
+        relative_angle_deg = math.degrees(ceiling_bulb._wrapped_angle())
+        current_marker_visibility = ceiling_angle_markers["current"]["imageable"].ComputeVisibility()
+        current_marker_hidden = current_marker_visibility == UsdGeom.Tokens.invisible
+        passed = (
+            ceiling_bulb.progress.state is CeilingBulbState.UNLOCKED
+            and not joint_enabled
+            and current_marker_hidden
+        )
+        print(
+            f"[VERIFY][CEILING_BULB] {'PASS' if passed else 'FAIL'} "
+            f"state={ceiling_bulb.progress.state.value} "
+            f"angle={ceiling_bulb.progress.logical_angle_deg:.3f}deg "
+            f"loosened={ceiling_bulb.progress.loosened_angle_deg:.3f}deg "
+            f"remaining={ceiling_bulb.progress.remaining_angle_deg:.3f}deg "
+            f"relative_angle={relative_angle_deg:.3f}deg "
+            f"joint_enabled={joint_enabled} "
+            f"current_marker_visibility={current_marker_visibility}"
+        )
+        if not passed:
+            raise RuntimeError("Ceiling bulb verification failed")
+
 
 def main() -> None:
     sim_cfg = sim_utils.SimulationCfg(
@@ -216,10 +411,20 @@ def main() -> None:
     sim.set_camera_view(eye=(4.5, 4.5, 3.2), target=(0.0, 0.0, 1.0))
 
     scene = InteractiveScene(RflyarmSceneCfg(num_envs=1, env_spacing=0.0))
+    ceiling_bulb_joint = define_ceiling_bulb_joint(
+        sim.stage,
+        verify_velocity_deg_s=-60.0 if args_cli.verify_ceiling_bulb else None,
+    )
     sim.reset()
     scene.update(0.0)
+    ceiling_bulb = CeilingBulbMechanism(
+        joint=ceiling_bulb_joint,
+        socket=scene["ceiling_socket"],
+        bulb=scene["ceiling_bulb"],
+    )
+    ceiling_bulb.reset()
     print("[Rflyarm] Isaac Lab scene setup complete")
-    run_simulator(sim, scene)
+    run_simulator(sim, scene, ceiling_bulb)
 
 
 if __name__ == "__main__":

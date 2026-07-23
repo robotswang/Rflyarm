@@ -36,11 +36,13 @@ class FlightController:
         # crossing the target at high speed.
         self.k_pos = torch.tensor((0.8, 0.8, 1.8), device=self.device)
         self.k_vel = torch.tensor((3.0, 3.0, 5.0), device=self.device)
-        self.k_int = torch.tensor((0.05, 0.05, 0.08), device=self.device)
+        # Integral compensation removes the residual position bias caused by
+        # tilt/thrust allocation and actuator discretization.
+        self.k_int = torch.tensor((0.30, 0.30, 0.50), device=self.device)
         self.k_rot = torch.tensor((300.0, 300.0, 300.0), device=self.device)
         self.k_angvel = torch.tensor((125.0, 125.0, 125.0), device=self.device)
         self.position_integral = torch.zeros((robot.num_instances, 3), device=self.device)
-        self.integral_limit = 1.0
+        self.integral_limit = 2.0
         self.integral_band = 0.5
         self.max_horizontal_velocity = 2.5
         self.max_vertical_velocity = 1.5
@@ -70,8 +72,9 @@ class FlightController:
     def set_target(self, position, yaw: float = 0.0) -> None:
         self.command[:, :3] = torch.as_tensor(position, device=self.device, dtype=torch.float32)
         self.command[:, 3] = float(yaw)
-        # A previous target's integral bias must not drive the next step command.
-        self.position_integral.zero_()
+        # Preserve a small fraction of the accumulated bias across target
+        # updates; clearing it completely recreates a steady-state offset.
+        self.position_integral.mul_(0.25)
 
     def state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         pose = self._to_torch(self.robot.data.body_link_pose_w)[:, self.body_id]

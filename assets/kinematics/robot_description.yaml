@@ -4,7 +4,7 @@
 # The generalized coordinates (cspace) are the 6 main arm joints. The gripper joints exist in the
 # URDF but must NOT be part of the IK cspace, so they are pinned to a fixed value via
 # cspace_to_urdf_rules below. FK/IK uses the fixed URDF frame "tool_center"
-# attached to Link6 at the grasp center.
+# attached to Link6 at the grasp center, 8 cm outward from the fingertip midpoint along the tool axis.
 
 api_version: 1.0
 

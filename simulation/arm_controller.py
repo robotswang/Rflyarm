@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import torch
+import numpy as np
+from scipy.spatial.transform import Rotation, Slerp
 
 from simulation.arm_kinematics import ArmKinematics
 
@@ -16,7 +18,7 @@ KINEMATICS_JOINT_SIGNS = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
 class ArmController:
     """Own the arm position targets and apply slew limiting every physics step."""
 
-    def __init__(self, robot, max_speed: float = 1.5):
+    def __init__(self, robot, max_speed: float = 1.5, cartesian_speed: float = 0.15):
         self.robot = robot
         self.device = robot.device
         ids, names = robot.find_joints(ARM_JOINT_NAMES, preserve_order=True)
@@ -38,6 +40,12 @@ class ArmController:
         self.gripper_target = torch.full_like(self._all_positions()[:, self.gripper_id], 0.5)
         self.kinematics = ArmKinematics()
         self.last_ik_solution = None
+        self.cartesian_speed = float(cartesian_speed)
+        self._cartesian_start = None
+        self._cartesian_goal = None
+        self._cartesian_elapsed = 0.0
+        self._cartesian_duration = 0.0
+        self._last_cartesian_position = None
 
     def _proxy_to_torch(self, array) -> torch.Tensor:
         value = getattr(array, "torch", array)
@@ -68,7 +76,9 @@ class ArmController:
                 raise ValueError(f"Unknown joint name: {name}")
 
     def set_cartesian_target(self, frame_id, position, quaternion_xyzw):
-        """Solve and apply a full-pose target in the arm ``base_link`` frame."""
+        """Start a smooth Cartesian trajectory to a validated full-pose target."""
+        position, quaternion_xyzw = self.kinematics.validate_pose(
+            frame_id, position, quaternion_xyzw)
         measured = (
             self._positions()[0] * self.kinematics_joint_signs
         ).detach().cpu().numpy()
@@ -83,14 +93,62 @@ class ArmController:
             warm_start=measured,
             fallback_seeds=fallback_seeds,
         )
-        self.last_ik_solution = result.joint_positions.copy()
-        self.set_joint_target(
-            torch.as_tensor(result.joint_positions, device=self.device, dtype=torch.float32)
-            * self.kinematics_joint_signs
-        )
+        # The endpoint solve only validates reachability.  Do not use that
+        # endpoint configuration as the seed for the first interpolated pose:
+        # it can belong to a different IK branch from the live configuration.
+        # Start the trajectory from the measured configuration instead.
+        self.last_ik_solution = measured.copy()
+        start_position, start_quaternion = self.end_effector_pose()
+        distance = float(np.linalg.norm(position - start_position))
+        # Consecutive commands with the same Cartesian position define a pure
+        # attitude transition. Keep translation exactly constant instead of
+        # re-planning from the current tracking residual.
+        if self._last_cartesian_position is not None and np.array_equal(
+            position, self._last_cartesian_position):
+            start_position = position.copy()
+        self._cartesian_start = (start_position.copy(), start_quaternion.copy())
+        self._cartesian_goal = (position.copy(), quaternion_xyzw.copy())
+        self._cartesian_elapsed = 0.0
+        # Give pure attitude transitions enough time for the PhysX joint drives
+        # to track without converting angular motion into TCP translation.
+        self._cartesian_duration = max(distance / self.cartesian_speed, 2.0)
+        self._last_cartesian_position = position.copy()
         return result
 
     def update(self, dt: float) -> None:
+        if self._cartesian_goal is not None:
+            self._cartesian_elapsed = min(
+                self._cartesian_elapsed + float(dt), self._cartesian_duration)
+            alpha = self._cartesian_elapsed / self._cartesian_duration
+            start_pos, start_quat = self._cartesian_start
+            goal_pos, goal_quat = self._cartesian_goal
+            position = (1.0 - alpha) * start_pos + alpha * goal_pos
+            rotations = Rotation.from_quat(np.stack((start_quat, goal_quat)))
+            slerp = Slerp([0.0, 1.0], rotations)
+            quaternion = slerp([alpha]).as_quat()[0]
+            measured = (self._positions()[0] * self.kinematics_joint_signs).detach().cpu().numpy()
+            try:
+                # Prefer the measured configuration so every intermediate IK
+                # solve stays on the branch physically being tracked.  The
+                # previous solution remains a fallback for solver robustness.
+                warm_start = measured
+                fallback_seeds = (
+                    self.last_ik_solution,
+                ) if self.last_ik_solution is not None else ()
+                result = self.kinematics.solve(
+                    "base_link", position, quaternion, warm_start,
+                    fallback_seeds=fallback_seeds)
+                self.last_ik_solution = result.joint_positions.copy()
+                self.target[:] = torch.as_tensor(
+                    result.joint_positions, device=self.device, dtype=torch.float32
+                ).reshape(1, 6) * self.kinematics_joint_signs
+            except RuntimeError:
+                pass
+            if alpha >= 1.0:
+                self._cartesian_goal = None
+        # Keep a joint-rate safety bound even during Cartesian trajectories.
+        # Normally IK changes are below this limit; it prevents a rare branch
+        # switch or solver glitch from becoming a one-frame physical jump.
         max_delta = self.max_speed * float(dt)
         delta = torch.clamp(self.target - self.commanded, -max_delta, max_delta)
         self.commanded += delta

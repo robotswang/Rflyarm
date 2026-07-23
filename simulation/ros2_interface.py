@@ -22,10 +22,11 @@ if str(ros_python_path) not in sys.path:
 
 import rclpy
 from builtin_interfaces.msg import Time
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped, TwistStamped
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import CameraInfo, Image, JointState
+from std_msgs.msg import Float64, String
 from tf2_msgs.msg import TFMessage
 
 
@@ -41,6 +42,7 @@ class Ros2Interface:
         robot,
         flight_controller,
         arm_controller,
+        ceiling_bulb=None,
         depth_camera=None,
         publish_hz: float = 60.0,
         camera_publish_hz: float = 15.0,
@@ -48,6 +50,7 @@ class Ros2Interface:
         self.robot = robot
         self.flight = flight_controller
         self.arm = arm_controller
+        self.ceiling_bulb = ceiling_bulb
         self.depth_camera = depth_camera
         self.publish_period = 1.0 / max(float(publish_hz), 1.0)
         self.publish_accumulator = 0.0
@@ -67,8 +70,28 @@ class Ros2Interface:
         )
 
         self.drone_pose_publisher = self.node.create_publisher(PoseStamped, "/drone/pose", qos)
+        self.drone_velocity_publisher = self.node.create_publisher(
+            TwistStamped, "/drone/velocity", qos
+        )
         self.joint_state_publisher = self.node.create_publisher(JointState, "/joint_states", qos)
         self.ee_pose_publisher = self.node.create_publisher(PoseStamped, "/arm/ee_pose", qos)
+        self.ceiling_bulb_state_publisher = None
+        self.ceiling_bulb_distance_publisher = None
+        self.ceiling_bulb_pose_publisher = None
+        self.ceiling_bulb_initial_pose_publisher = None
+        if self.ceiling_bulb is not None:
+            self.ceiling_bulb_state_publisher = self.node.create_publisher(
+                String, "/ceiling_bulb/state", qos
+            )
+            self.ceiling_bulb_distance_publisher = self.node.create_publisher(
+                Float64, "/ceiling_bulb/distance", qos
+            )
+            self.ceiling_bulb_pose_publisher = self.node.create_publisher(
+                PoseStamped, "/ceiling_bulb/pose", qos
+            )
+            self.ceiling_bulb_initial_pose_publisher = self.node.create_publisher(
+                PoseStamped, "/ceiling_bulb/initial_pose", qos
+            )
         clock_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
@@ -113,6 +136,10 @@ class Ros2Interface:
         self.node.create_subscription(PoseStamped, "/drone/cmd_pose", self._flight_command_callback, qos)
         self.node.create_subscription(JointState, "/joint_command", self._joint_command_callback, qos)
         self.node.create_subscription(PoseStamped, "/arm/cmd_pose", self._arm_pose_callback, qos)
+        if self.ceiling_bulb is not None:
+            self.node.create_subscription(
+                String, "/ceiling_bulb/cmd", self._ceiling_bulb_command_callback, qos
+            )
 
         # Fail fast if the project-local URDF/Lula model cannot be used.
         self.arm.kinematics.load()
@@ -170,6 +197,33 @@ class Ros2Interface:
         except Exception as exc:
             self.node.get_logger().error(f"Rejected arm pose command: {exc}")
 
+    def _ceiling_bulb_command_callback(self, message: String) -> None:
+        try:
+            command = str(message.data).strip().lower()
+            if command in ("complete_removal", "release", "release_bulb"):
+                self.ceiling_bulb.complete_removal()
+                detail = "released after the replacement sequence"
+            elif command in ("engage", "engage_loose", "attach"):
+                self.ceiling_bulb.engage_loose()
+                detail = "re-engaged from the existing gripper grasp"
+            elif command in ("resume_grasp", "release_hold"):
+                self.ceiling_bulb.resume_grasp()
+                detail = "released the temporary hold after regrasp"
+            elif command.startswith("tighten_"):
+                degrees = float(command.removeprefix("tighten_"))
+                self.ceiling_bulb.tighten_step(degrees)
+                detail = f"tightened by {degrees:g} degrees"
+            else:
+                raise ValueError(
+                    "/ceiling_bulb/cmd accepts complete_removal, engage_loose, "
+                    "resume_grasp, or tighten_<degrees>; "
+                    "the bulb is already held by the gripper and is never loaded "
+                    "by this interface"
+                )
+            self.node.get_logger().info(f"Ceiling bulb {detail}")
+        except Exception as exc:
+            self.node.get_logger().error(f"Rejected ceiling bulb command: {exc}")
+
     def process_commands(self) -> None:
         """Process pending ROS commands without advancing any ROS-side clock."""
 
@@ -200,6 +254,41 @@ class Ros2Interface:
         self._publish_body_tf(sim_time_ns)
         self._publish_joint_states(sim_time_ns)
         self._publish_ee_pose(sim_time_ns)
+        self._publish_ceiling_bulb_state()
+
+    def _publish_ceiling_bulb_state(self) -> None:
+        if self.ceiling_bulb_state_publisher is None:
+            return
+        message = String()
+        message.data = self.ceiling_bulb.progress.state.value
+        self.ceiling_bulb_state_publisher.publish(message)
+        distance_message = Float64()
+        distance_message.data = self.ceiling_bulb.separation_m
+        self.ceiling_bulb_distance_publisher.publish(distance_message)
+        current_pose = self.ceiling_bulb.current_root_pose_xyzw
+        self.ceiling_bulb_pose_publisher.publish(
+            self._pose_message(current_pose, self.last_sim_time_ns)
+        )
+        initial_pose = self.ceiling_bulb.initial_root_pose_xyzw
+        if initial_pose is not None:
+            self.ceiling_bulb_initial_pose_publisher.publish(
+                self._pose_message(initial_pose, self.last_sim_time_ns)
+            )
+
+    def _pose_message(self, pose_xyzw: tuple[float, ...], sim_time_ns: int) -> PoseStamped:
+        message = PoseStamped()
+        message.header.stamp = self._stamp(sim_time_ns)
+        message.header.frame_id = "map"
+        (
+            message.pose.position.x,
+            message.pose.position.y,
+            message.pose.position.z,
+            message.pose.orientation.x,
+            message.pose.orientation.y,
+            message.pose.orientation.z,
+            message.pose.orientation.w,
+        ) = pose_xyzw
+        return message
 
     @staticmethod
     def _stamp(sim_time_ns: int) -> Time:
@@ -214,7 +303,7 @@ class Ros2Interface:
         self.clock_publisher.publish(message)
 
     def _publish_drone_pose(self, sim_time_ns: int) -> None:
-        position, quaternion, _linear_velocity, _angular_velocity = self.flight.state()
+        position, quaternion, linear_velocity, angular_velocity = self.flight.state()
         message = PoseStamped()
         message.header.stamp = self._stamp(sim_time_ns)
         message.header.frame_id = "map"
@@ -228,6 +317,21 @@ class Ros2Interface:
             message.pose.orientation.w,
         ) = (float(value) for value in quaternion[0].tolist())
         self.drone_pose_publisher.publish(message)
+
+        velocity_message = TwistStamped()
+        velocity_message.header.stamp = message.header.stamp
+        velocity_message.header.frame_id = "map"
+        (
+            velocity_message.twist.linear.x,
+            velocity_message.twist.linear.y,
+            velocity_message.twist.linear.z,
+        ) = (float(value) for value in linear_velocity[0].tolist())
+        (
+            velocity_message.twist.angular.x,
+            velocity_message.twist.angular.y,
+            velocity_message.twist.angular.z,
+        ) = (float(value) for value in angular_velocity[0].tolist())
+        self.drone_velocity_publisher.publish(velocity_message)
 
     def _publish_body_tf(self, sim_time_ns: int) -> None:
         position, quaternion, _linear_velocity, _angular_velocity = self.flight.state()

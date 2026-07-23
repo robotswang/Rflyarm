@@ -740,15 +740,15 @@
       effort="100"
       velocity="5" />
   </joint>
-  <!-- Tool Center Point (grasp center): fixed frame for IK/FK, placed at the midpoint of the two
-       distal fingertip frames (Gripper_l3/r3), expressed in Link6's local frame. Added for the Lula
-       solver only; the physics articulation has no matching prim and does not need one. -->
+  <!-- Tool Center Point (grasp center): fixed frame for IK/FK, placed 8 cm outward from the
+       midpoint of the two distal fingertip frames (Gripper_l3/r3), expressed in Link6's local
+       frame. Added for the Lula solver only; the physics articulation has no matching prim. -->
   <link name="tool_center" />
   <joint
     name="tool_center_joint"
     type="fixed">
     <origin
-      xyz="0.0004 0.007 0.0752"
+      xyz="0.0004 0.007 0.1552"
       rpy="0 0 0" />
     <parent
       link="Link6" />

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import CameraCfg
 from isaaclab.utils.configclass import configclass
@@ -33,6 +33,18 @@ class RflyarmSceneCfg(InteractiveSceneCfg):
     world = AssetBaseCfg(
         prim_path="/World/layout",
         spawn=sim_utils.UsdFileCfg(usd_path=str(WORLD_USD)),
+    )
+
+    # Bind tensor views only to the ceiling instance. The shared target_bulb.usd
+    # and the separately spawned inclined_target_bulb remain unmodified.
+    ceiling_socket = RigidObjectCfg(
+        prim_path="/World/layout/target_bulb/Socket",
+        spawn=None,
+    )
+
+    ceiling_bulb = RigidObjectCfg(
+        prim_path="/World/layout/target_bulb/Bulb",
+        spawn=None,
     )
 
     inclined_panel = AssetBaseCfg(
