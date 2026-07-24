@@ -8,6 +8,59 @@ import isaaclab.utils.math as math_utils
 from isaaclab_contrib.controllers.lee_controller_utils import compute_desired_orientation
 
 
+PLATFORM_LOCK_BODY_PATH = "/World/layout/rflyarm/body"
+PLATFORM_LOCK_JOINT_PATH = "/World/platform_lock_joint"
+
+
+def define_platform_lock_joint(stage):
+    """Create the disabled external FixedJoint used to lock the flight body."""
+
+    from pxr import Gf, Sdf, UsdGeom, UsdPhysics
+
+    body_prim = stage.GetPrimAtPath(PLATFORM_LOCK_BODY_PATH)
+    if not body_prim.IsValid():
+        raise RuntimeError(
+            f"Platform-lock rigid body not found: {PLATFORM_LOCK_BODY_PATH}"
+        )
+    if not body_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        raise RuntimeError(
+            f"Platform-lock target is not a rigid body: {PLATFORM_LOCK_BODY_PATH}"
+        )
+
+    # Initialize the disabled world-side frame at the authored body pose so
+    # PhysX does not report a misleading disjoint-joint warning at startup.
+    body_world = UsdGeom.XformCache().GetLocalToWorldTransform(body_prim)
+    body_transform = Gf.Transform(body_world)
+    initial_position = body_transform.GetTranslation()
+    initial_quaternion = body_transform.GetRotation().GetQuat()
+    initial_imaginary = initial_quaternion.GetImaginary()
+
+    joint = UsdPhysics.FixedJoint.Define(stage, PLATFORM_LOCK_JOINT_PATH)
+    joint.CreateBody1Rel().SetTargets([Sdf.Path(PLATFORM_LOCK_BODY_PATH)])
+    joint.CreateLocalPos0Attr(
+        Gf.Vec3f(
+            float(initial_position[0]),
+            float(initial_position[1]),
+            float(initial_position[2]),
+        )
+    )
+    joint.CreateLocalPos1Attr(Gf.Vec3f(0.0, 0.0, 0.0))
+    joint.CreateLocalRot0Attr(
+        Gf.Quatf(
+            float(initial_quaternion.GetReal()),
+            Gf.Vec3f(
+                float(initial_imaginary[0]),
+                float(initial_imaginary[1]),
+                float(initial_imaginary[2]),
+            ),
+        )
+    )
+    joint.CreateLocalRot1Attr(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    joint.CreateCollisionEnabledAttr(False)
+    joint.CreateJointEnabledAttr(False)
+    return joint
+
+
 class FlightController:
     """Track a world-frame ``(x, y, z, yaw)`` target with a body wrench.
 
@@ -16,7 +69,13 @@ class FlightController:
     of from ``robot.data.root_*``.
     """
 
-    def __init__(self, robot, dt: float, target=(0.0, 0.0, 1.5, 0.0)):
+    def __init__(
+        self,
+        robot,
+        dt: float,
+        target=(0.0, 0.0, 1.5, 0.0),
+        lock_joint=None,
+    ):
         self.robot = robot
         self.device = robot.device
         self.dt = float(dt)
@@ -56,6 +115,9 @@ class FlightController:
         # command inside the approximately 21 N*m hover allocation envelope.
         self.max_yaw_torque = 20.0
         self.rotation_matrix_buffer = torch.zeros((robot.num_instances, 3, 3), device=self.device)
+        self.lock_joint = lock_joint
+        self._platform_locked = False
+        self._locked_body_pose = None
 
     def _to_torch(self, array) -> torch.Tensor:
         value = getattr(array, "torch", array)
@@ -69,12 +131,95 @@ class FlightController:
     def target_position(self) -> torch.Tensor:
         return self.command[0, :3]
 
+    @property
+    def platform_locked(self) -> bool:
+        return self._platform_locked
+
+    @property
+    def locked_body_pose(self) -> torch.Tensor | None:
+        return self._locked_body_pose
+
     def set_target(self, position, yaw: float = 0.0) -> None:
-        self.command[:, :3] = torch.as_tensor(position, device=self.device, dtype=torch.float32)
+        if self._platform_locked:
+            raise RuntimeError("drone target is locked; unlock the platform first")
+        new_position = torch.as_tensor(
+            position,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        changed_axes = torch.abs(self.command[:, :3] - new_position) > 1.0e-6
+        integral_decay = torch.where(
+            changed_axes,
+            torch.full_like(self.position_integral, 0.25),
+            torch.ones_like(self.position_integral),
+        )
+        self.position_integral.mul_(integral_decay)
+        self.command[:, :3] = new_position
         self.command[:, 3] = float(yaw)
-        # Preserve a small fraction of the accumulated bias across target
-        # updates; clearing it completely recreates a steady-state offset.
-        self.position_integral.mul_(0.25)
+        # Preserve integral compensation on axes whose command did not change.
+        # This is important during the final vertical approach: repeated z-only
+        # ROS commands must not discard the x/y force needed to resist contact
+        # friction at the ceiling.
+
+    def lock_platform(self) -> None:
+        """Enable a FixedJoint whose anchor frame matches the physical body pose."""
+
+        if self._platform_locked:
+            return
+        if self.lock_joint is None:
+            raise RuntimeError("platform FixedJoint was not configured")
+        self._locked_body_pose = self._to_torch(
+            self.robot.data.body_link_pose_w
+        )[:, self.body_id].clone()
+        # Keep the rotors and flight controller active without letting the
+        # locked x/y residual wind up against the platform constraint. Retain
+        # the commanded ceiling preload only in z.
+        self.command[:, :2] = self._locked_body_pose[:, :2]
+        self.position_integral.zero_()
+
+        # With body0 omitted, joint frame 0 is expressed directly in world.
+        # Set it to the captured PhysX body pose while frame 1 remains the body
+        # origin, so enabling the joint introduces no positional snap.
+        from pxr import Gf
+
+        local_position = self._locked_body_pose[0, :3].detach().cpu().tolist()
+        local_quaternion = self._locked_body_pose[0, 3:].detach().cpu().tolist()
+        self.lock_joint.GetLocalPos0Attr().Set(Gf.Vec3f(*local_position))
+        self.lock_joint.GetLocalRot0Attr().Set(
+            Gf.Quatf(
+                float(local_quaternion[3]),
+                Gf.Vec3f(*local_quaternion[:3]),
+            )
+        )
+        self.lock_joint.GetJointEnabledAttr().Set(False)
+        # Remove only the residual vehicle root velocity at engagement. From
+        # this point onward PhysX resolves all rotor, arm, and contact forces
+        # through the joint instead of a per-frame pose teleport.
+        self.robot.write_root_velocity_to_sim_index(
+            root_velocity=torch.zeros(
+                (self.robot.num_instances, 6),
+                device=self.device,
+                dtype=self._locked_body_pose.dtype,
+            )
+        )
+        self.lock_joint.GetJointEnabledAttr().Set(True)
+        self._platform_locked = True
+
+    def unlock_platform(self) -> None:
+        """Release the articulation root without stopping the flight controller."""
+
+        if not self._platform_locked:
+            return
+        if self.lock_joint is None:
+            raise RuntimeError("platform FixedJoint was not configured")
+        current_pose = self._to_torch(
+            self.robot.data.body_link_pose_w
+        )[:, self.body_id].clone()
+        self.lock_joint.GetJointEnabledAttr().Set(False)
+        self._platform_locked = False
+        self._locked_body_pose = None
+        self.command[:, :3] = current_pose[:, :3]
+        self.position_integral.zero_()
 
     def state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         pose = self._to_torch(self.robot.data.body_link_pose_w)[:, self.body_id]
@@ -90,9 +235,10 @@ class FlightController:
         position, quaternion, linear_velocity_w, angular_velocity_b = self.state()
         position_error = self.command[:, :3] - position
 
-        in_band = torch.linalg.vector_norm(position_error, dim=1) < self.integral_band
-        self.position_integral[in_band] += position_error[in_band] * self.dt
-        self.position_integral[~in_band] = 0.0
+        if not self._platform_locked:
+            in_band = torch.linalg.vector_norm(position_error, dim=1) < self.integral_band
+            self.position_integral[in_band] += position_error[in_band] * self.dt
+            self.position_integral[~in_band] = 0.0
         self.position_integral.clamp_(-self.integral_limit, self.integral_limit)
 
         desired_velocity_w = self.k_pos * position_error

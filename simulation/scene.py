@@ -105,8 +105,14 @@ class RflyarmSceneCfg(InteractiveSceneCfg):
     )
 
     depth_camera = CameraCfg(
-        prim_path=f"{RFLYARM_PRIM_PATH}/body/depth_camera",
+        # Fabric does not propagate a moving rigid body's USD transform to
+        # visual children reliably. Spawn the sensor independently and drive
+        # its world pose from the physical flight-body truth every sim step.
+        prim_path="/World/depth_camera",
         update_period=1.0 / 15.0,
+        # Keep the reported camera pose synchronized with the explicitly
+        # driven world transform instead of returning the initialization pose.
+        update_latest_camera_pose=True,
         height=240,
         width=320,
         # Keep a color AOV active. A depth-only RTX render product switches

@@ -18,7 +18,13 @@ KINEMATICS_JOINT_SIGNS = (-1.0, -1.0, -1.0, 1.0, 1.0, 1.0)
 class ArmController:
     """Own the arm position targets and apply slew limiting every physics step."""
 
-    def __init__(self, robot, max_speed: float = 1.5, cartesian_speed: float = 0.15):
+    def __init__(
+        self,
+        robot,
+        max_speed: float = 1.5,
+        cartesian_speed: float = 0.15,
+        cartesian_angular_speed: float = np.deg2rad(10.0),
+    ):
         self.robot = robot
         self.device = robot.device
         ids, names = robot.find_joints(ARM_JOINT_NAMES, preserve_order=True)
@@ -41,6 +47,11 @@ class ArmController:
         self.kinematics = ArmKinematics()
         self.last_ik_solution = None
         self.cartesian_speed = float(cartesian_speed)
+        self.cartesian_angular_speed = float(cartesian_angular_speed)
+        if self.cartesian_speed <= 0.0:
+            raise ValueError("cartesian_speed must be positive")
+        if self.cartesian_angular_speed <= 0.0:
+            raise ValueError("cartesian_angular_speed must be positive")
         self._cartesian_start = None
         self._cartesian_goal = None
         self._cartesian_elapsed = 0.0
@@ -109,9 +120,21 @@ class ArmController:
         self._cartesian_start = (start_position.copy(), start_quaternion.copy())
         self._cartesian_goal = (position.copy(), quaternion_xyzw.copy())
         self._cartesian_elapsed = 0.0
-        # Give pure attitude transitions enough time for the PhysX joint drives
-        # to track without converting angular motion into TCP translation.
-        self._cartesian_duration = max(distance / self.cartesian_speed, 2.0)
+        angular_distance = float(
+            (
+                Rotation.from_quat(start_quaternion).inv()
+                * Rotation.from_quat(quaternion_xyzw)
+            ).magnitude()
+        )
+        # Bound translation and rotation independently.  The previous fixed
+        # two-second duration ignored rotation angle, so a 60-degree wrist
+        # stroke advanced faster than the physical joint drives could track
+        # synchronously and converted their lag into tool-center translation.
+        self._cartesian_duration = max(
+            distance / self.cartesian_speed,
+            angular_distance / self.cartesian_angular_speed,
+            0.1,
+        )
         self._last_cartesian_position = position.copy()
         return result
 

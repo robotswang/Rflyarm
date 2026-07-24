@@ -11,12 +11,14 @@ CEILING_BULB_ROOT_PATH = "/World/layout/target_bulb"
 CEILING_SOCKET_PATH = f"{CEILING_BULB_ROOT_PATH}/Socket"
 CEILING_BULB_PATH = f"{CEILING_BULB_ROOT_PATH}/Bulb"
 CEILING_JOINT_PATH = f"{CEILING_BULB_ROOT_PATH}/ceiling_screw_joint"
+CEILING_BULB_MASS_KG = 100.0
 
 JOINT_LIMIT_DEG = 180.0
 RELEASE_STROKE_DEG = 180.0
+LOOSE_ENDPOINT_MARGIN_DEG = 0.1
 UNLOCK_TOLERANCE_DEG = 5.0
 LOCKED_TOLERANCE_DEG = 1.0
-INSTALL_ALIGNMENT_DURATION_S = 2.0
+PRE_ROTATION_ALIGNMENT_DURATION_S = 2.0
 
 
 class CeilingBulbState(str, Enum):
@@ -43,6 +45,29 @@ def relative_twist_z(socket_xyzw, bulb_xyzw) -> float:
     relative_z = cw * bz + cx * by - cy * bx + cz * bw
     relative_w = cw * bw - cx * bx - cy * by - cz * bz
     return _wrap_to_pi(2.0 * math.atan2(relative_z, relative_w))
+
+
+def loose_endpoint_quaternion_xyzw(quaternion_xyzw):
+    """Rotate a locked bulb pose to the loose end of its local-Z travel."""
+
+    x, y, z, w = (float(value) for value in quaternion_xyzw)
+    # Exactly -180 degrees is quaternion-equivalent to +180 degrees.  PhysX
+    # can therefore select the +180 representation when a disabled joint is
+    # re-enabled, see it outside the authored [-180, 0] interval, and snap the
+    # bulb straight to the locked (green-marker) endpoint.  Stay just inside
+    # the negative limit so the passive joint preserves the red-marker pose.
+    half_angle = math.radians(
+        -(RELEASE_STROKE_DEG - LOOSE_ENDPOINT_MARGIN_DEG)
+    ) / 2.0
+    sine = math.sin(half_angle)
+    cosine = math.cos(half_angle)
+    # q_loose = q_locked * q_z(angle), with both quaternions in xyzw order.
+    return (
+        x * cosine + y * sine,
+        -x * sine + y * cosine,
+        w * sine + z * cosine,
+        w * cosine - z * sine,
+    )
 
 
 @dataclass
@@ -94,21 +119,27 @@ class CeilingBulbProgress:
         self.rejected_tightening = False
         self.state = CeilingBulbState.UNLOCKED
 
-    def tighten_step(self, degrees: float) -> None:
-        """Advance deterministic installation progress after one wrist stroke."""
+    def observe_tightening_angle(
+        self,
+        wrapped_angle_rad: float,
+        *,
+        allow_lock: bool,
+    ) -> float:
+        """Mirror the true joint angle and optionally accept the locked endpoint."""
 
         if self.state is not CeilingBulbState.SCREWING:
             raise RuntimeError("ceiling bulb must be SCREWING before tightening")
-        degrees = float(degrees)
-        if not math.isfinite(degrees) or degrees <= 0.0:
-            raise ValueError("tightening degrees must be positive and finite")
-        self.loosened_angle_rad = max(
-            0.0,
-            self.loosened_angle_rad - math.radians(degrees),
+        current_angle_rad = _wrap_to_pi(wrapped_angle_rad)
+        self.previous_wrapped_angle_rad = current_angle_rad
+        self.loosened_angle_rad = min(
+            self._release_stroke_rad,
+            abs(current_angle_rad),
         )
-        if self.loosened_angle_rad <= self._locked_tolerance_rad:
+        self.rejected_tightening = False
+        if allow_lock and self.loosened_angle_rad <= self._locked_tolerance_rad:
             self.loosened_angle_rad = 0.0
             self.state = CeilingBulbState.LOCKED
+        return math.degrees(current_angle_rad)
 
     @property
     def remaining_angle_deg(self) -> float:
@@ -129,9 +160,8 @@ class CeilingBulbProgress:
         wrapped_angle_rad = _wrap_to_pi(wrapped_angle_rad)
         delta = _wrap_to_pi(wrapped_angle_rad - self.previous_wrapped_angle_rad)
         self.previous_wrapped_angle_rad = wrapped_angle_rad
-        # Installation progress is committed explicitly by tighten_step().
-        # Do not count the same wrist stroke again from the physical joint
-        # observation, otherwise one motion advances the logical screw twice.
+        # Installation progress is sampled directly after each completed wrist
+        # stroke. Do not alter it during per-frame updates.
         if self.state is CeilingBulbState.SCREWING:
             return self.state
         # The software coordinate starts at 0 degrees locked. Negative physical
@@ -158,7 +188,7 @@ class CeilingBulbProgress:
 
 
 def define_ceiling_bulb_joint(stage, verify_velocity_deg_s: float | None = None):
-    """Author the passive joint only on the ceiling bulb stage instance."""
+    """Author the mass override and passive joint on the ceiling bulb instance."""
 
     from pxr import Gf, Sdf, UsdPhysics
 
@@ -169,6 +199,20 @@ def define_ceiling_bulb_joint(stage, verify_velocity_deg_s: float | None = None)
         if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
             raise RuntimeError(f"Ceiling bulb prim is not a rigid body: {prim_path}")
 
+    bulb_prim = stage.GetPrimAtPath(CEILING_BULB_PATH)
+    mass_api = (
+        UsdPhysics.MassAPI(bulb_prim)
+        if bulb_prim.HasAPI(UsdPhysics.MassAPI)
+        else UsdPhysics.MassAPI.Apply(bulb_prim)
+    )
+    mass_api.CreateMassAttr().Set(CEILING_BULB_MASS_KG)
+    authored_mass = mass_api.GetMassAttr().Get()
+    if authored_mass is None or not math.isclose(
+        float(authored_mass), CEILING_BULB_MASS_KG, abs_tol=1.0e-6
+    ):
+        raise RuntimeError(
+            f"Failed to set ceiling bulb mass to {CEILING_BULB_MASS_KG:.3f} kg"
+        )
     joint = UsdPhysics.RevoluteJoint.Define(stage, CEILING_JOINT_PATH)
     joint.CreateBody0Rel().SetTargets([Sdf.Path(CEILING_SOCKET_PATH)])
     joint.CreateBody1Rel().SetTargets([Sdf.Path(CEILING_BULB_PATH)])
@@ -212,8 +256,18 @@ class CeilingBulbMechanism:
         self.progress = CeilingBulbProgress()
         self._reported_state = None
         self._initial_root_pose_w = None
+        self._loose_root_pose_w = None
         self._alignment_start_pose_w = None
         self._alignment_elapsed_s = 0.0
+        mass = bulb.data.body_mass
+        mass = getattr(mass, "torch", mass)
+        mass_kg = float(mass.reshape(-1)[0].item())
+        if not math.isclose(mass_kg, CEILING_BULB_MASS_KG, abs_tol=1.0e-4):
+            raise RuntimeError(
+                "Ceiling bulb PhysX mass mismatch: "
+                f"expected {CEILING_BULB_MASS_KG:.3f} kg, got {mass_kg:.3f} kg"
+            )
+        print(f"[Rflyarm][CEILING_BULB] mass={mass_kg:.3f} kg")
 
     @staticmethod
     def _quaternion_xyzw(rigid_object):
@@ -288,25 +342,45 @@ class CeilingBulbMechanism:
         self.joint.CreateJointEnabledAttr(True).Set(True)
         self.progress.reset(self._wrapped_angle())
         self._initial_root_pose_w = self._root_pose_tensor().clone()
+        self._loose_root_pose_w = self._initial_root_pose_w.clone()
+        locked_quaternion = self._initial_root_pose_w[0, 3:7].tolist()
+        self._loose_root_pose_w[0, 3:7] = self._loose_root_pose_w.new_tensor(
+            loose_endpoint_quaternion_xyzw(locked_quaternion)
+        )
         self._alignment_start_pose_w = None
         self._alignment_elapsed_s = 0.0
         self._reported_state = None
         self._report_state()
 
     def engage_loose(self) -> None:
-        """Start installation without recreating a snapping physical joint."""
+        """Align the inserted bulb to the loose endpoint before tightening."""
 
+        if self._initial_root_pose_w is None or self._loose_root_pose_w is None:
+            raise RuntimeError("bulb installation poses are not initialized")
         wrapped_angle_rad = self._wrapped_angle()
         self.joint.GetJointEnabledAttr().Set(False)
-        self._set_bulb_kinematic(False)
         self.progress.engage_loose(wrapped_angle_rad)
+        # Preserve the startup world position but begin at the physical loose
+        # endpoint: just inside -180 degrees about the socket/bulb local Z axis.
+        # This avoids the quaternion +/-180 ambiguity when the joint is enabled.
+        # Tightening then moves the yellow marker clockwise from red back to
+        # green and restores the exact startup orientation.
+        self._set_bulb_kinematic(True)
+        self._alignment_start_pose_w = self._root_pose_tensor().clone()
+        self._alignment_elapsed_s = 0.0
+        self.progress.state = CeilingBulbState.ALIGNING
         self._report_state()
 
     def resume_grasp(self) -> None:
-        """Release the temporary hold after the gripper has closed again."""
+        """Restore the passive screw joint after the gripper has closed again."""
 
         if self.progress.state is not CeilingBulbState.SCREWING:
             raise RuntimeError("ceiling bulb must be SCREWING before resuming grasp")
+        # engage_loose() disables the joint while the bulb is moved kinematically
+        # onto the exact loose pose.  Re-enable the revolute constraint before
+        # returning the bulb to dynamic simulation so its translation remains
+        # fixed at the socket while the gripper rotates it.
+        self.joint.GetJointEnabledAttr().Set(True)
         self._set_bulb_kinematic(False)
 
     def complete_removal(self) -> None:
@@ -317,20 +391,35 @@ class CeilingBulbMechanism:
         self.joint.GetJointEnabledAttr().Set(False)
         self._report_state()
 
-    def tighten_step(self, degrees: float) -> None:
-        """Record the screw progress produced by a completed wrist stroke."""
+    def hold_tightening_stroke(self, *, allow_lock: bool) -> float:
+        """Hold a completed stroke at its true angle and optionally finish."""
 
-        self.progress.tighten_step(degrees)
-        self.progress.previous_wrapped_angle_rad = self._wrapped_angle()
+        actual_angle_degrees = self.progress.observe_tightening_angle(
+            self._wrapped_angle(),
+            allow_lock=allow_lock,
+        )
         # Hold the bulb at the completed stroke while the gripper opens and
-        # returns to its reset pose.  At LOCKED this becomes the final ceiling
-        # attachment, avoiding a runtime joint recreation and its snap impulse.
+        # returns to its reset pose. Once LOCKED, restore the exact startup
+        # world pose so the final installed position and orientation are
+        # identical to the original bulb pose.
         self._set_bulb_kinematic(True)
         if self.progress.state is CeilingBulbState.LOCKED:
-            self._alignment_start_pose_w = self._root_pose_tensor().clone()
-            self._alignment_elapsed_s = 0.0
-            self.progress.state = CeilingBulbState.ALIGNING
+            if self._initial_root_pose_w is None:
+                raise RuntimeError("initial bulb pose is not initialized")
+            self.bulb.write_root_pose_to_sim_index(
+                root_pose=self._initial_root_pose_w.clone()
+            )
+            initial_quaternion = self._pose_components(
+                self._initial_root_pose_w
+            )[3:7]
+            self.progress.previous_wrapped_angle_rad = relative_twist_z(
+                self._quaternion_xyzw(self.socket),
+                initial_quaternion,
+            )
+        else:
+            self.progress.previous_wrapped_angle_rad = self._wrapped_angle()
         self._report_state()
+        return actual_angle_degrees
 
     def _report_state(self) -> None:
         if self.progress.state is self._reported_state:
@@ -346,32 +435,44 @@ class CeilingBulbMechanism:
             )
         )
 
-    def _advance_alignment(self, dt: float) -> None:
-        if self._initial_root_pose_w is None or self._alignment_start_pose_w is None:
+    def _advance_pre_rotation_alignment(self, dt: float) -> None:
+        if self._loose_root_pose_w is None or self._alignment_start_pose_w is None:
             raise RuntimeError("bulb alignment poses are not initialized")
         import torch
 
         self._alignment_elapsed_s += max(float(dt), 0.0)
-        alpha = min(1.0, self._alignment_elapsed_s / INSTALL_ALIGNMENT_DURATION_S)
-        start = self._alignment_start_pose_w
-        target = self._initial_root_pose_w
-        start_quaternion = start[:, 3:7]
-        target_quaternion = target[:, 3:7]
-        if bool(torch.sum(start_quaternion * target_quaternion).item() < 0.0):
-            target_quaternion = -target_quaternion
-        pose = start * (1.0 - alpha) + target.clone() * alpha
-        pose[:, 3:7] = (1.0 - alpha) * start_quaternion + alpha * target_quaternion
-        pose[:, 3:7] /= torch.linalg.vector_norm(
-            pose[:, 3:7], dim=1, keepdim=True
-        ).clamp_min(1.0e-8)
+        alpha = min(
+            1.0,
+            self._alignment_elapsed_s / PRE_ROTATION_ALIGNMENT_DURATION_S,
+        )
+        if alpha >= 1.0:
+            pose = self._loose_root_pose_w.clone()
+        else:
+            # Smoothstep gives zero interpolation velocity at both ends.
+            blend = alpha * alpha * (3.0 - 2.0 * alpha)
+            start = self._alignment_start_pose_w
+            target = self._loose_root_pose_w
+            start_quaternion = start[:, 3:7]
+            target_quaternion = target[:, 3:7]
+            if bool(torch.sum(start_quaternion * target_quaternion).item() < 0.0):
+                target_quaternion = -target_quaternion
+            pose = start * (1.0 - blend) + target.clone() * blend
+            pose[:, 3:7] = (
+                (1.0 - blend) * start_quaternion
+                + blend * target_quaternion
+            )
+            pose[:, 3:7] /= torch.linalg.vector_norm(
+                pose[:, 3:7], dim=1, keepdim=True
+            ).clamp_min(1.0e-8)
         self.bulb.write_root_pose_to_sim_index(root_pose=pose)
         if alpha >= 1.0:
-            self.progress.state = CeilingBulbState.LOCKED
+            self._alignment_start_pose_w = None
+            self.progress.state = CeilingBulbState.SCREWING
             self._report_state()
 
     def update(self, dt: float = 0.0) -> None:
         if self.progress.state is CeilingBulbState.ALIGNING:
-            self._advance_alignment(dt)
+            self._advance_pre_rotation_alignment(dt)
             return
         previous_state = self.progress.state
         state = self.progress.update(self._wrapped_angle())
